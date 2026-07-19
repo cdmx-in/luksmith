@@ -7,3 +7,7 @@ disk.img
 .venv/
 ui/node_modules/
 ui/dist/
+
+# Go build artifacts
+server-go/*.exe
+server-go/luksmith-server
