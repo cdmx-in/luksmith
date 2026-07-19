@@ -83,13 +83,13 @@ Put TLS in front (Caddy/nginx) or pass `--tls-cert/--tls-key`. The web portal at
 ### 3. Agent (each Ubuntu 22.04/24.04 machine, disk already LUKS-encrypted)
 
 ```bash
-wget https://github.com/cdmx-in/luksmith/releases/latest/download/luksmith.deb
-sudo apt install ./luksmith.deb
+curl -fsSL https://cdmx-in.github.io/luksmith/setup.sh | sudo sh   # adds the apt repo + keyring
+sudo apt install luksmith
 sudo luksmith enroll --server https://YOUR-PORTAL:8443 \
   --org-pubkey /etc/luksmith/org_public.pem --enroll-secret YOUR-SECRET
 ```
 
-(From a checkout instead: `sudo ./install.sh` does the same.)
+Updates then arrive via normal `sudo apt upgrade`. Alternatives: grab `luksmith.deb` straight from [releases](https://github.com/cdmx-in/luksmith/releases) (`sudo apt install ./luksmith.deb`), or `sudo ./install.sh` from a checkout.
 
 Enroll prompts once for the existing LUKS passphrase, then: recovery key created → escrowed → TPM auto-unlock bound → PCR baseline stored. Next reboot: no passphrase prompt.
 
@@ -111,7 +111,29 @@ Intune can't hold the key, but it can *enforce that escrow happened*:
 | `--mode systemd` | dracut installs, Ubuntu ≥25.10, or non-root data volumes | Native `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7` |
 | `--no-tpm` | Servers/VMs without TPM, or escrow-only rollouts | Recovery key + escrow only; passphrase prompt remains |
 
-PCR policy is **7 only** (Secure Boot certificates) by default — routine kernel/GRUB updates don't change it, so no recovery prompts after `apt upgrade`. What *does* change it (Secure Boot toggles, dbx/firmware updates): `luksmith check-updates` flags pending fwupd updates marked `affects-fde` before you reboot, and `verify` re-binds automatically after.
+PCR policy is **7 only** (Secure Boot certificates) by default — routine kernel/GRUB updates don't change it, so no recovery prompts after `apt upgrade`. What *does* change it (Secure Boot toggles, dbx/firmware updates): `luksmith check-updates` flags pending fwupd updates marked `affects-fde` before you reboot, and `verify` re-binds automatically after (pass `--unlock-key-file` to let it rebind from scratch when the old binding can't unseal at all).
+
+### Suspend (BitLocker-style, one reboot)
+
+Firmware updates rewrite PCR 7 and break TPM auto-unlock on the next boot. Before a risky reboot:
+
+```bash
+sudo luksmith suspend            # or: sudo luksmith check-updates --suspend
+```
+
+This adds a *temporary* TPM slot with no PCR policy, so the machine still auto-unlocks after the update. On the next `luksmith verify`, once the boot is verified and any PCR drift is rebound, the temporary slot is removed automatically — suspension lasts exactly one reboot, like BitLocker's `Suspend-BitLocker`. `check-updates --suspend` chains detection and suspension (and still exits 2 so schedulers notice).
+
+### TPM + PIN
+
+```bash
+sudo luksmith enroll --mode systemd --with-pin ...
+```
+
+Boot then requires the TPM state *and* a PIN (prompted by systemd) — BitLocker's TPM+PIN equivalent. systemd mode only; clevis has no PIN support and the agent refuses the combination.
+
+### Software TPM (swtpm)
+
+A set `TPM2TOOLS_TCTI` counts as a present TPM — tpm2-tools and clevis honor it, so the whole clevis lifecycle runs against `swtpm socket --tpm2` (use `sudo -E` to keep the variable). CI's `tpm-integration` job uses exactly this to prove enroll → verify → PCR drift → auto-rebind on every push.
 
 ## Security model
 
@@ -122,14 +144,10 @@ PCR policy is **7 only** (Secure Boot certificates) by default — routine kerne
 
 ## What CI proves
 
-Every push exercises the full chain on a real LUKS2 volume: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`) → admin-triggered rotation → **the old key no longer opens it, the new one does**. Plus unit tests on Python 3.10/3.12 (Ubuntu 22.04/24.04's interpreters), the Intune discovery script run against fixture data, shellcheck, and a Docker image build with a live health check. Hosted runners have no TPM, so the TPM bind itself is covered by unit tests; a swtpm-in-VM job is on the roadmap.
+Every push exercises the full chain on a real LUKS2 volume — against **both** portal implementations: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`) → admin-triggered rotation → **the old key no longer opens it, the new one does**. A separate job runs the **complete TPM lifecycle against a software TPM (swtpm)**: clevis enroll → verified TPM unlock → PCR 7 extended to simulate a firmware update → drift detected → automatic re-bind → verified TPM unlock again. Plus unit tests on Python 3.10/3.12, Go tests, the Intune discovery script against fixture data, shellcheck, the UI build, and a Docker image build with live health check.
 
 ## Roadmap
 
-- [ ] apt repository for the agent `.deb`
-- [ ] swtpm-based CI job exercising the full clevis TPM path
-- [ ] BitLocker-style pre-reboot suspend (temporary PCR-less slot) around `affects-fde` firmware updates
-- [ ] TPM+PIN enrollment UX (`--tpm2-with-pin`) as a first-class mode
 - [ ] `systemd-pcrlock` support once usable on shipped Ubuntu (≥25.10/26.04)
 - [ ] Multi-admin RBAC + SSO on the portal; per-key two-person reveal approval
 - [ ] Fedora/RHEL support (dracut is already the easy path)

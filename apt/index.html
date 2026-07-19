@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>luksmith apt repository</title>
+<style>body{font-family:system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem}pre{background:#f4f4f4;padding:.75rem;overflow-x:auto}</style>
+<h1>luksmith apt repository</h1>
+<p>Org-grade LUKS management for Ubuntu 22.04/24.04. Quick setup:</p>
+<pre>curl -fsSL https://cdmx-in.github.io/luksmith/setup.sh | sudo sh
+sudo apt install luksmith</pre>
+<p>Or manually:</p>
+<pre>sudo curl -fsSL https://cdmx-in.github.io/luksmith/luksmith-archive-keyring.gpg \
+  -o /usr/share/keyrings/luksmith-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/luksmith-archive-keyring.gpg] https://cdmx-in.github.io/luksmith ./' \
+  | sudo tee /etc/apt/sources.list.d/luksmith.list
+sudo apt update &amp;&amp; sudo apt install luksmith</pre>
+<p>Updates arrive via normal <code>apt upgrade</code>.
+Source: <a href="https://github.com/cdmx-in/luksmith">github.com/cdmx-in/luksmith</a></p>

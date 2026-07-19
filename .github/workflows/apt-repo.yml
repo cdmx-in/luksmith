@@ -1,0 +1,95 @@
+name: Publish apt repo
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install repo tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y dpkg-dev apt-utils
+
+      - name: Download .deb assets from all releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          mkdir -p site
+          # ponytail: versioned debs only; the bare luksmith.deb alias would collide across releases
+          for tag in $(gh release list --limit 1000 --json tagName -q '.[].tagName'); do
+            gh release download "$tag" --pattern 'luksmith_*_all.deb' --dir site --clobber || true
+          done
+          ls -l site
+
+      - name: Build flat apt repo (Packages, Release)
+        run: |
+          set -eux
+          cp apt/index.html apt/setup.sh site/
+          cd site
+          dpkg-scanpackages --multiversion . /dev/null > Packages
+          gzip -9 -k Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=luksmith \
+            -o APT::FTPArchive::Release::Label=luksmith \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Description="luksmith apt repository" \
+            release . > Release
+
+      - name: Sign Release (or warn if APT_GPG_PRIVATE_KEY is missing)
+        env:
+          GPG_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -eu
+          if [ -z "$GPG_KEY" ]; then
+            {
+              echo '## :warning: apt repo published UNSIGNED'
+              echo
+              echo 'The `APT_GPG_PRIVATE_KEY` secret is not set, so the Release file is not signed.'
+              echo 'Clients fall back to `[trusted=yes]`, which disables apt authentication.'
+              echo
+              echo 'To fix, on a trusted machine:'
+              echo '```sh'
+              echo 'gpg --full-generate-key   # choose ECC (sign only) / ed25519, no expiry, name "luksmith apt repo"'
+              echo 'gpg --armor --export-secret-keys <KEYID> > apt-signing.key'
+              echo '```'
+              echo 'Then add the contents of `apt-signing.key` as a repository secret named'
+              echo '`APT_GPG_PRIVATE_KEY` (Settings -> Secrets and variables -> Actions),'
+              echo 'delete the local file, and re-run this workflow.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf '%s' "$GPG_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')
+          cd site
+          gpg --batch --yes -u "$KEYID" --pinentry-mode loopback --clearsign -o InRelease Release
+          gpg --batch --yes -u "$KEYID" --pinentry-mode loopback --detach-sign --armor -o Release.gpg Release
+          gpg --batch --export "$KEYID" > luksmith-archive-keyring.gpg
+          echo ':white_check_mark: apt repo signed with key `'"$KEYID"'`' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

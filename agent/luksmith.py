@@ -107,7 +107,10 @@ def pick_device(explicit):
 
 
 def has_tpm():
-    return os.path.exists("/dev/tpmrm0") or os.path.exists("/dev/tpm0")
+    # TPM2TOOLS_TCTI covers software TPMs (swtpm) — tpm2-tools and clevis
+    # both honor it, and child processes inherit it automatically.
+    return (os.path.exists("/dev/tpmrm0") or os.path.exists("/dev/tpm0")
+            or bool(os.environ.get("TPM2TOOLS_TCTI")))
 
 
 def luks_tokens(device):
@@ -118,13 +121,18 @@ def luks_tokens(device):
     return re.findall(r"^\s+\d+:\s+(\S+)$", p.stdout, re.MULTILINE)
 
 
-def clevis_tpm2_slot(device):
-    """First clevis tpm2 keyslot number, or None."""
+def clevis_tpm2_slots(device):
+    """All clevis tpm2 keyslot numbers."""
     p = run(["clevis", "luks", "list", "-d", device])
     if p.returncode != 0:
-        return None
-    m = re.search(r"^(\d+):\s+tpm2", p.stdout, re.MULTILINE)
-    return int(m.group(1)) if m else None
+        return []
+    return [int(m) for m in re.findall(r"^(\d+):\s+tpm2", p.stdout, re.MULTILINE)]
+
+
+def clevis_tpm2_slot(device):
+    """First clevis tpm2 keyslot number, or None."""
+    slots = clevis_tpm2_slots(device)
+    return slots[0] if slots else None
 
 
 def read_pcr7():
@@ -199,6 +207,7 @@ def write_compliance(state, extra=None):
         "escrow_key_id": state.get("escrow_key_id"),
         "last_verify": state.get("last_verify"),
         "last_boot_class": state.get("last_boot_class"),
+        "suspended": bool(state.get("suspended")),
     }
     if extra:
         data.update(extra)
@@ -219,6 +228,8 @@ def cmd_status(args):
         "pcr7_baseline": state.get("pcr7_baseline"),
         "pcr7_current": read_pcr7(),
         "last_boot_class": state.get("last_boot_class"),
+        "pin": bool(state.get("pin")),
+        "suspended": bool(state.get("suspended")),
     }
     print(json.dumps(out, indent=2))
 
@@ -240,7 +251,7 @@ def enroll_recovery_key(device, unlock_key_file):
     return m.group(0)
 
 
-def tpm_bind(device, mode, pcrs, unlock_key_file):
+def tpm_bind(device, mode, pcrs, unlock_key_file, with_pin=False):
     if mode == "clevis":
         if not shutil.which("clevis"):
             die("clevis not installed (apt install clevis clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools)")
@@ -251,10 +262,20 @@ def tpm_bind(device, mode, pcrs, unlock_key_file):
         p = run(cmd, stdin=None)
         if p.returncode != 0:
             die(f"clevis luks bind failed: {(p.stderr or '').strip()}")
-        install_tss_hook()
-        run(["update-initramfs", "-u"], stdin=None)
+        # Initramfs refresh failures are non-fatal: the TPM binding lives in
+        # the LUKS header regardless (CI runners have no cryptroot setup).
+        try:
+            install_tss_hook()
+        except OSError as e:
+            print(f"luksmith: warning: tss hook install failed: {e}", file=sys.stderr)
+        p = run(["update-initramfs", "-u"], stdin=None)
+        if p.returncode != 0:
+            print("luksmith: warning: update-initramfs failed: "
+                  f"{(p.stderr or '').strip()}", file=sys.stderr)
     else:  # systemd (dracut / non-root volumes)
         cmd = ["systemd-cryptenroll", "--tpm2-device=auto", f"--tpm2-pcrs={pcrs}"]
+        if with_pin:
+            cmd.append("--tpm2-with-pin=yes")  # PIN prompt is systemd's own
         if unlock_key_file:
             cmd.append(f"--unlock-key-file={unlock_key_file}")
         cmd.append(device)
@@ -285,6 +306,9 @@ def install_tss_hook():
 
 
 def cmd_enroll(args):
+    if args.with_pin and args.mode != "systemd":
+        die("--with-pin requires --mode systemd (and a dracut initrd): "
+            "TPM+PIN is a systemd-cryptenroll feature; clevis has no PIN support")
     config = load_json(CONFIG_PATH, {})
     if args.server:
         config["server_url"] = args.server
@@ -326,8 +350,10 @@ def cmd_enroll(args):
         print("recovery key escrowed; skipping TPM bind"
               + ("" if has_tpm() else " (no TPM present)"))
     else:
-        tpm_bind(device, args.mode, args.pcrs, args.unlock_key_file)
+        tpm_bind(device, args.mode, args.pcrs, args.unlock_key_file, args.with_pin)
         state["tpm_mode"] = args.mode
+        state["pcrs"] = args.pcrs
+        state["pin"] = bool(args.with_pin)
         state["pcr7_baseline"] = read_pcr7()
 
     state["luks_device"] = device
@@ -376,14 +402,32 @@ def cmd_verify(args):
     regenerated = False
     if (drift or boot_class == "fallback_used") and state.get("tpm_mode") == "clevis" \
             and not args.no_regen:
-        slot = clevis_tpm2_slot(state["luks_device"])
+        slots = [s for s in clevis_tpm2_slots(state["luks_device"])
+                 if s != state.get("suspend_slot")]
+        slot = slots[0] if slots else None
         if slot is not None:
+            # regen recovers the passphrase from an existing clevis binding
+            # (e.g. a PCR-less suspend slot survives drift) or prompts; with
+            # stdin closed a prompt just fails instead of hanging.
             p = run(["clevis", "luks", "regen", "-q", "-d", state["luks_device"],
-                     "-s", str(slot)])
+                     "-s", str(slot)], stdin=subprocess.DEVNULL)
             regenerated = p.returncode == 0
+            if not regenerated and args.unlock_key_file:
+                # After drift the old secret can't be unsealed, so rebind
+                # from scratch against current PCRs using the provided key.
+                run(["clevis", "luks", "unbind", "-d", state["luks_device"],
+                     "-s", str(slot), "-f"])
+                tpm_bind(state["luks_device"], "clevis",
+                         state.get("pcrs", "7"), args.unlock_key_file)
+                regenerated = True
             if regenerated:
                 state["pcr7_baseline"] = read_pcr7()
                 drift = False
+
+    # BitLocker semantics: suspension lasts exactly one reboot. Once this
+    # boot is verified and any drift is rebound, drop the temporary slot.
+    if state.get("suspended") and not drift:
+        clear_suspension(state)
 
     state["last_boot_class"] = boot_class
     state["last_verify"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -441,6 +485,77 @@ def cmd_rotate(args):
                      indent=2))
 
 
+def do_suspend(state, unlock_key_file):
+    """Add a TEMPORARY non-PCR-bound TPM protector (BitLocker suspend).
+
+    The next reboot auto-unlocks even if firmware updates change PCR 7;
+    `verify` removes the slot after that one boot.
+    """
+    if not has_tpm():
+        die("no TPM available; nothing to suspend")
+    if state.get("suspended"):
+        print(json.dumps({"suspended": True,
+                          "suspend_slot": state.get("suspend_slot")}, indent=2))
+        return
+    device = state.get("luks_device") or pick_device(None)
+    state["luks_device"] = device
+    mode = state.get("tpm_mode") or "clevis"
+    if mode == "clevis":
+        before = set(clevis_tpm2_slots(device))
+        cmd = ["clevis", "luks", "bind", "-d", device, "tpm2", "{}"]  # no PCR policy
+        if unlock_key_file:
+            cmd[3:3] = ["-k", unlock_key_file]
+        p = run(cmd, stdin=None)
+        if p.returncode != 0:
+            die(f"clevis suspend bind failed: {(p.stderr or '').strip()}")
+        new = set(clevis_tpm2_slots(device)) - before
+        state["suspend_slot"] = min(new) if new else None
+    else:
+        cmd = ["systemd-cryptenroll", "--tpm2-device=auto", "--tpm2-pcrs="]
+        if unlock_key_file:
+            cmd.append(f"--unlock-key-file={unlock_key_file}")
+        cmd.append(device)
+        p = run(cmd, stdin=None)
+        if p.returncode != 0:
+            die(f"systemd-cryptenroll suspend enrollment failed: {(p.stderr or '').strip()}")
+        m = re.search(r"key slot (\d+)", p.stdout or "")
+        state["suspend_slot"] = int(m.group(1)) if m else None
+    state["suspended"] = True
+    save_json(STATE_PATH, state)
+    write_compliance(state)
+    print(json.dumps({"suspended": True,
+                      "suspend_slot": state["suspend_slot"]}, indent=2))
+
+
+def clear_suspension(state):
+    """Remove the temporary PCR-less slot and drop the suspended flag."""
+    slot = state.get("suspend_slot")
+    if slot is None:
+        print("luksmith: warning: suspend slot unknown; remove any PCR-less "
+              "TPM slot manually", file=sys.stderr)
+    else:
+        if state.get("tpm_mode") == "systemd":
+            p = run(["systemd-cryptenroll", f"--wipe-slot={slot}",
+                     state["luks_device"]])
+        else:
+            p = run(["clevis", "luks", "unbind", "-d", state["luks_device"],
+                     "-s", str(slot), "-f"])
+        if p.returncode != 0:
+            print(f"luksmith: warning: could not remove suspend slot {slot}: "
+                  f"{(p.stderr or '').strip()}", file=sys.stderr)
+            return False
+    state["suspended"] = False
+    state.pop("suspend_slot", None)
+    return True
+
+
+def cmd_suspend(args):
+    state = load_json(STATE_PATH, {})
+    if args.device:
+        state["luks_device"] = args.device
+    do_suspend(state, args.unlock_key_file)
+
+
 def cmd_check_updates(args):
     """Flag pending updates that will change PCR 7 (fwupd `affects-fde`)."""
     p = run(["fwupdmgr", "get-updates", "--json"])
@@ -457,9 +572,10 @@ def cmd_check_updates(args):
             pass
     print(json.dumps({"fde_breaking_updates": risky}, indent=2))
     if risky:
-        # ponytail: report-only for now; BitLocker-style pre-suspend
-        # (temporary PCR-less slot before reboot) is the upgrade path.
-        sys.exit(2)
+        if getattr(args, "suspend", False):
+            do_suspend(load_json(STATE_PATH, {}),
+                       getattr(args, "unlock_key_file", None))
+        sys.exit(2)  # still exit 2 so schedulers notice
 
 
 def main(argv=None):
@@ -480,18 +596,34 @@ def main(argv=None):
     en.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
     en.add_argument("--no-tpm", action="store_true",
                     help="escrow only, skip TPM auto-unlock")
+    en.add_argument("--with-pin", action="store_true",
+                    help="require a PIN at boot in addition to the TPM "
+                         "(systemd mode only; PIN prompt is interactive)")
 
     ve = sub.add_parser("verify", help="post-boot: classify boot, detect PCR drift, re-enroll")
     ve.add_argument("--no-regen", action="store_true", help="report only, never rebind")
+    ve.add_argument("--unlock-key-file",
+                    help="passphrase file used to rebind when the sealed "
+                         "secret can no longer be unsealed after PCR drift")
 
     ro = sub.add_parser("rotate", help="replace + re-escrow the recovery key")
     ro.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
 
-    sub.add_parser("check-updates", help="warn about pending PCR-breaking firmware updates")
+    su = sub.add_parser("suspend",
+                        help="add a temporary PCR-less TPM slot before a risky "
+                             "reboot (auto-removed by verify after one boot)")
+    su.add_argument("--device", help="LUKS device (auto-detected if single)")
+    su.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
+
+    cu = sub.add_parser("check-updates", help="warn about pending PCR-breaking firmware updates")
+    cu.add_argument("--suspend", action="store_true",
+                    help="auto-suspend TPM PCR policy when FDE-breaking updates are found")
+    cu.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
 
     args = ap.parse_args(argv)
     {"status": cmd_status, "enroll": cmd_enroll, "verify": cmd_verify,
-     "rotate": cmd_rotate, "check-updates": cmd_check_updates}[args.cmd](args)
+     "rotate": cmd_rotate, "suspend": cmd_suspend,
+     "check-updates": cmd_check_updates}[args.cmd](args)
 
 
 if __name__ == "__main__":

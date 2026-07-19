@@ -24,8 +24,8 @@ jobs:
     # decrypt with the org private key -> prove the recovered key opens the
     # volume -> rotate -> prove the old key is dead and the new one works.
     # Runs against BOTH portal implementations to pin API parity.
-    # No TPM on hosted runners, so the TPM bind is skipped (--no-tpm); the
-    # clevis path needs swtpm/VM runners (roadmap).
+    # No hardware TPM on hosted runners, so the TPM bind is skipped here
+    # (--no-tpm); the real clevis TPM path runs in tpm-integration via swtpm.
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -124,6 +124,88 @@ jobs:
         run: |
           sudo python3 agent/luksmith.py verify --no-regen | tee verify.json
           grep -q '"boot_class": "no_tpm_binding"' verify.json
+
+  tpm-integration:
+    # Full TPM lifecycle against a software TPM (swtpm): clevis enroll ->
+    # verify tpm_unlock_ok -> extend PCR 7 (simulated firmware update) ->
+    # verify detects drift and rebinds against the NEW PCR value -> verify
+    # reports tpm_unlock_ok again.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install swtpm + clevis stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y swtpm clevis clevis-luks clevis-tpm2 tpm2-tools cryptsetup-bin
+
+      - name: Start software TPM
+        run: |
+          set -eux
+          mkdir -p /tmp/tpmstate
+          swtpm socket --tpm2 --server port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --tpmstate dir=/tmp/tpmstate &
+          sleep 1
+          export TPM2TOOLS_TCTI="swtpm:port=2321"
+          tpm2_pcrread sha256:7
+          echo 'TPM2TOOLS_TCTI=swtpm:port=2321' >> "$GITHUB_ENV"
+
+      - name: Create LUKS2 test volume
+        run: |
+          set -eux
+          truncate -s 64M disk.img
+          echo -n "original-passphrase" > pass.txt
+          sudo cryptsetup luksFormat --type luks2 --batch-mode disk.img pass.txt
+          LOOP=$(sudo losetup --find --show disk.img)
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+
+      - name: Generate org RSA keypair
+        run: |
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out org_private.pem
+          openssl pkey -in org_private.pem -pubout -out org_public.pem
+
+      - name: Start escrow server
+        run: |
+          python3 server/luksmith_server.py --db ci.db --port 8443 \
+            --admin-token ci-admin --enroll-secret ci-enroll &
+          sleep 1
+          curl -sf http://127.0.0.1:8443/healthz
+
+      - name: Enroll with clevis TPM bind (sudo -E keeps TCTI)
+        run: |
+          set -eux
+          sudo -E python3 agent/luksmith.py enroll \
+            --server http://127.0.0.1:8443 \
+            --org-pubkey "$PWD/org_public.pem" \
+            --enroll-secret ci-enroll \
+            --device "$LOOP" \
+            --mode clevis --pcrs 7 \
+            --unlock-key-file "$PWD/pass.txt" | tee enroll.json
+          grep -q '"tpm_mode": "clevis"' enroll.json
+          sudo -E clevis luks list -d "$LOOP" | tee clevis.txt
+          grep -q 'tpm2' clevis.txt
+
+      - name: Verify reports tpm_unlock_ok
+        run: |
+          set -eux
+          sudo -E python3 agent/luksmith.py verify --no-regen | tee verify1.json
+          grep -q '"boot_class": "tpm_unlock_ok"' verify1.json
+
+      - name: Simulate PCR drift, prove detection + auto-rebind
+        run: |
+          set -eux
+          tpm2_pcrextend 7:sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+          sudo -E python3 agent/luksmith.py verify \
+            --unlock-key-file "$PWD/pass.txt" | tee verify2.json
+          grep -Eq '"boot_class": "fallback_used"|"pcr7_drift": true' verify2.json
+          grep -q '"rebound": true' verify2.json
+
+      - name: Verify clean again after rebind
+        run: |
+          set -eux
+          sudo -E python3 agent/luksmith.py verify --no-regen | tee verify3.json
+          grep -q '"boot_class": "tpm_unlock_ok"' verify3.json
+          grep -q '"pcr7_drift": false' verify3.json
 
   intune-script:
     runs-on: ubuntu-latest

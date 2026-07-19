@@ -117,6 +117,160 @@ class TestClassifyBoot(unittest.TestCase):
             self.assertEqual(luksmith.classify_boot(state), "tpm_unlock_ok")
 
 
+class TestHasTpm(unittest.TestCase):
+    def test_tcti_env_counts_as_tpm(self):
+        with mock.patch.object(luksmith.os.path, "exists", return_value=False):
+            with mock.patch.dict(luksmith.os.environ,
+                                 {"TPM2TOOLS_TCTI": "swtpm:port=2321"}):
+                self.assertTrue(luksmith.has_tpm())
+            with mock.patch.dict(luksmith.os.environ, {}, clear=True):
+                self.assertFalse(luksmith.has_tpm())
+
+    def test_dev_tpm_still_detected(self):
+        with mock.patch.object(luksmith.os.path, "exists",
+                               side_effect=lambda p: p == "/dev/tpmrm0"), \
+                mock.patch.dict(luksmith.os.environ, {}, clear=True):
+            self.assertTrue(luksmith.has_tpm())
+
+
+class TestSuspend(unittest.TestCase):
+    def test_clevis_suspend_binds_pcrless_and_records_slot(self):
+        state = {"luks_device": "/dev/sda3", "tpm_mode": "clevis"}
+        lists = iter(["1: tpm2 '{...}'\n", "1: tpm2 '{...}'\n2: tpm2 '{}'\n"])
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ["clevis", "luks", "list"]:
+                return proc(next(lists))
+            if cmd[:3] == ["clevis", "luks", "bind"]:
+                return proc("")
+            raise AssertionError(cmd)
+
+        with mock.patch.object(luksmith, "run", side_effect=fake), \
+                mock.patch.object(luksmith, "has_tpm", return_value=True), \
+                mock.patch.object(luksmith, "save_json"), \
+                mock.patch.object(luksmith, "write_compliance"), \
+                mock.patch("builtins.print"):
+            luksmith.do_suspend(state, None)
+        bind = next(c for c in calls if c[:3] == ["clevis", "luks", "bind"])
+        self.assertEqual(bind[-2:], ["tpm2", "{}"])  # empty config = no PCR policy
+        self.assertEqual(state["suspend_slot"], 2)
+        self.assertTrue(state["suspended"])
+
+    def test_systemd_suspend_uses_empty_pcr_list(self):
+        state = {"luks_device": "/dev/sda3", "tpm_mode": "systemd"}
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            return proc("New TPM2 token enrolled as key slot 3.")
+
+        with mock.patch.object(luksmith, "run", side_effect=fake), \
+                mock.patch.object(luksmith, "has_tpm", return_value=True), \
+                mock.patch.object(luksmith, "save_json"), \
+                mock.patch.object(luksmith, "write_compliance"), \
+                mock.patch("builtins.print"):
+            luksmith.do_suspend(state, "/tmp/pass")
+        self.assertEqual(calls[0][:2], ["systemd-cryptenroll", "--tpm2-device=auto"])
+        self.assertIn("--tpm2-pcrs=", calls[0])
+        self.assertIn("--unlock-key-file=/tmp/pass", calls[0])
+        self.assertEqual(state["suspend_slot"], 3)
+        self.assertTrue(state["suspended"])
+
+    def test_clear_suspension_unbinds_and_clears(self):
+        state = {"luks_device": "/dev/sda3", "tpm_mode": "clevis",
+                 "suspended": True, "suspend_slot": 2}
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]):
+            self.assertTrue(luksmith.clear_suspension(state))
+        self.assertEqual(calls, [["clevis", "luks", "unbind", "-d", "/dev/sda3",
+                                  "-s", "2", "-f"]])
+        self.assertFalse(state["suspended"])
+        self.assertNotIn("suspend_slot", state)
+
+    def test_verify_clears_suspension_after_clean_boot(self):
+        state = {"device_id": "d", "luks_device": "/dev/sda3", "tpm_mode": "clevis",
+                 "suspended": True, "suspend_slot": 2}
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ["clevis", "luks", "list"]:
+                return proc("1: tpm2 '{...}'\n2: tpm2 '{}'\n")
+            if cmd[:3] == ["clevis", "luks", "pass"]:
+                return proc("sekrit")
+            if cmd[:3] == ["clevis", "luks", "unbind"]:
+                return proc("")
+            if cmd[0] == "tpm2_pcrread":
+                return proc("  7 : 0xAB\n")
+            raise AssertionError(cmd)
+
+        args = mock.Mock(no_regen=False, unlock_key_file=None)
+        with mock.patch.object(luksmith, "load_json",
+                               side_effect=lambda p, d=None:
+                               state if p == luksmith.STATE_PATH else {}), \
+                mock.patch.object(luksmith, "run", side_effect=fake_run), \
+                mock.patch.object(luksmith, "save_json"), \
+                mock.patch.object(luksmith, "write_compliance"), \
+                mock.patch("builtins.print"):
+            luksmith.cmd_verify(args)
+        self.assertIn(["clevis", "luks", "unbind", "-d", "/dev/sda3", "-s", "2", "-f"],
+                      calls)
+        self.assertFalse(state["suspended"])
+        self.assertNotIn("suspend_slot", state)
+
+    def test_check_updates_suspend_flag_triggers_suspend(self):
+        payload = json.dumps({"Devices": [
+            {"Name": "FW", "Releases": [{"Version": "1", "Flags": ["affects-fde"]}]}]})
+        args = mock.Mock(suspend=True, unlock_key_file="/tmp/pass")
+        with mock.patch.object(luksmith, "run", return_value=proc(payload)), \
+                mock.patch.object(luksmith, "do_suspend") as ds, \
+                mock.patch.object(luksmith, "load_json",
+                                  return_value={"luks_device": "/dev/x"}), \
+                mock.patch.object(luksmith.sys, "exit") as ex, \
+                mock.patch("builtins.print"):
+            luksmith.cmd_check_updates(args)
+        ds.assert_called_once_with({"luks_device": "/dev/x"}, "/tmp/pass")
+        ex.assert_called_once_with(2)
+
+    def test_check_updates_no_flag_does_not_suspend(self):
+        payload = json.dumps({"Devices": [
+            {"Name": "FW", "Releases": [{"Version": "1", "Flags": ["affects-fde"]}]}]})
+        args = mock.Mock(suspend=False)
+        with mock.patch.object(luksmith, "run", return_value=proc(payload)), \
+                mock.patch.object(luksmith, "do_suspend") as ds, \
+                mock.patch.object(luksmith.sys, "exit"), \
+                mock.patch("builtins.print"):
+            luksmith.cmd_check_updates(args)
+        ds.assert_not_called()
+
+
+class TestWithPin(unittest.TestCase):
+    def test_systemd_bind_appends_pin_flag(self):
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]):
+            luksmith.tpm_bind("/dev/x", "systemd", "7", None, with_pin=True)
+        self.assertIn("--tpm2-with-pin=yes", calls[0])
+
+    def test_systemd_bind_without_pin_omits_flag(self):
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]):
+            luksmith.tpm_bind("/dev/x", "systemd", "7", None)
+        self.assertNotIn("--tpm2-with-pin=yes", calls[0])
+
+    def test_clevis_mode_rejects_pin(self):
+        args = mock.Mock(mode="clevis", with_pin=True)
+        with mock.patch("builtins.print"), self.assertRaises(SystemExit):
+            luksmith.cmd_enroll(args)
+
+
 class TestFwupdParse(unittest.TestCase):
     def test_affects_fde_flag_detected(self):
         payload = json.dumps({"Devices": [
