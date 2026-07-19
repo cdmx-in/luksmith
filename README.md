@@ -74,7 +74,11 @@ LUKSMITH_ENROLL_SECRET=$(openssl rand -hex 16) \
 docker compose up -d
 ```
 
-No Docker? `python3 server/luksmith_server.py --admin-token ... --enroll-secret ...` — zero dependencies. Either way, put TLS in front (Caddy/nginx) or pass `--tls-cert/--tls-key`. Dashboard at `https://your-server:8443/` (HTTP Basic — any username, admin token as password).
+Two more ways to run it, same API and database either way:
+- **Static binary** (Go, no runtime at all): grab `luksmith-server-linux-amd64` + `luksmith-ui.tar.gz` from [releases](https://github.com/cdmx-in/luksmith/releases), `./luksmith-server-linux-amd64 --ui-dir dist --admin-token ... --enroll-secret ...`
+- **Zero-dependency Python**: `python3 server/luksmith_server.py --admin-token ... --enroll-secret ...`
+
+Put TLS in front (Caddy/nginx) or pass `--tls-cert/--tls-key`. The web portal at `https://your-server:8443/` is a React admin UI — token login, device fleet with boot/escrow health, audited key reveals, rotation, audit log.
 
 ### 3. Agent (each Ubuntu 22.04/24.04 machine, disk already LUKS-encrypted)
 
@@ -122,7 +126,7 @@ Every push exercises the full chain on a real LUKS2 volume: format → enroll �
 
 ## Roadmap
 
-- [x] `.deb` packaging (attached to releases); apt repo later
+- [ ] apt repository for the agent `.deb`
 - [ ] swtpm-based CI job exercising the full clevis TPM path
 - [ ] BitLocker-style pre-reboot suspend (temporary PCR-less slot) around `affects-fde` firmware updates
 - [ ] TPM+PIN enrollment UX (`--tpm2-with-pin`) as a first-class mode

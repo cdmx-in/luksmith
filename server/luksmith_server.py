@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import html
 import json
+import mimetypes
 import os
 import secrets
 import sqlite3
@@ -28,7 +29,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -190,6 +191,7 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     admin_token = None
     enroll_secret = None
+    ui_dir = None  # built React UI (ui/dist); None -> inline dashboard fallback
 
     # ------------------------------------------------------------- helpers
     def send(self, code, body, ctype="application/json"):
@@ -248,6 +250,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self.send(200, {"ok": True})
         if path == "/":
+            # Static SPA (if built) is public: it is useless without an admin
+            # token and the API stays Bearer-protected. Inline fallback keeps
+            # its Basic-auth gate.
+            if self.serve_ui("/index.html"):
+                return
             if not self.need_admin():
                 return
             return self.dashboard()
@@ -263,7 +270,24 @@ class Handler(BaseHTTPRequestHandler):
             if not self.need_admin():
                 return
             return self.send(200, {"audit": [dict(r) for r in self.store.audit_log()]})
+        if self.serve_ui(path):
+            return
         self.send(404, {"error": "not found"})
+
+    def serve_ui(self, path):
+        """Serve a static file from ui_dir; False if absent or path escapes it."""
+        if not self.ui_dir:
+            return False
+        root = os.path.realpath(self.ui_dir)
+        full = os.path.realpath(os.path.join(root, unquote(path).lstrip("/")))
+        if full != root and not full.startswith(root + os.sep):
+            return False  # path traversal attempt -> 404
+        if not os.path.isfile(full):
+            return False
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        with open(full, "rb") as f:
+            self.send(200, f.read(), ctype)
+        return True
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -382,6 +406,9 @@ def main(argv=None):
                     help="shared device-enrollment secret (or env LUKSMITH_ENROLL_SECRET)")
     ap.add_argument("--tls-cert", help="TLS certificate (PEM); omit only behind a reverse proxy")
     ap.add_argument("--tls-key", help="TLS private key (PEM)")
+    ap.add_argument("--ui-dir",
+                    help="built UI assets to serve (default: ui/dist next to this "
+                         "script, if present; else the inline dashboard)")
     args = ap.parse_args(argv)
 
     if not args.admin_token or not args.enroll_secret:
@@ -390,6 +417,9 @@ def main(argv=None):
     Handler.store = Store(args.db)
     Handler.admin_token = args.admin_token
     Handler.enroll_secret = args.enroll_secret
+    ui_dir = args.ui_dir or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "ui", "dist")
+    Handler.ui_dir = ui_dir if os.path.isdir(ui_dir) else None
 
     httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
     scheme = "http"

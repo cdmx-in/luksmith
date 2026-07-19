@@ -46,6 +46,35 @@ jobs:
           dpkg-deb --build --root-owner-group $PKG "luksmith_${VERSION}_all.deb"
           cp "luksmith_${VERSION}_all.deb" luksmith.deb
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server-go/go.mod
+          cache-dependency-path: server-go/go.sum
+
+      - name: Build portal UI + Go server binaries
+        run: |
+          set -eux
+          (cd ui && npm ci && npm run build)
+          tar -czf luksmith-ui.tar.gz -C ui dist
+          cd server-go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+            -o ../luksmith-server-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+            -o ../luksmith-server-linux-arm64 .
+
+      - name: Smoke-test the Go server binary
+        run: |
+          set -eux
+          tar -xzf luksmith-ui.tar.gz
+          ./luksmith-server-linux-amd64 --db smoke.db --port 8444 \
+            --admin-token t --enroll-secret s --ui-dir dist &
+          sleep 1
+          curl -sf http://127.0.0.1:8444/healthz
+          curl -sf http://127.0.0.1:8444/ | grep -qi luksmith
+
       - name: Smoke-test the .deb
         run: |
           set -eux
@@ -61,4 +90,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "luksmith $GITHUB_REF_NAME" \
             --generate-notes \
-            luksmith_*_all.deb luksmith.deb agent/luksmith.py install.sh
+            luksmith_*_all.deb luksmith.deb agent/luksmith.py install.sh \
+            luksmith-server-linux-amd64 luksmith-server-linux-arm64 luksmith-ui.tar.gz

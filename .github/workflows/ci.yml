@@ -23,11 +23,21 @@ jobs:
     # Real LUKS2 volume on a loop device: enroll -> escrow -> reveal ->
     # decrypt with the org private key -> prove the recovered key opens the
     # volume -> rotate -> prove the old key is dead and the new one works.
+    # Runs against BOTH portal implementations to pin API parity.
     # No TPM on hosted runners, so the TPM bind is skipped (--no-tpm); the
     # clevis path needs swtpm/VM runners (roadmap).
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        server: [python, go]
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        if: matrix.server == 'go'
+        with:
+          go-version-file: server-go/go.mod
+          cache-dependency-path: server-go/go.sum
 
       - name: Create LUKS2 test volume
         run: |
@@ -43,9 +53,19 @@ jobs:
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out org_private.pem
           openssl pkey -in org_private.pem -pubout -out org_public.pem
 
-      - name: Start escrow server
+      - name: Start escrow server (python)
+        if: matrix.server == 'python'
         run: |
           python3 server/luksmith_server.py --db ci.db --port 8443 \
+            --admin-token ci-admin --enroll-secret ci-enroll &
+          sleep 1
+          curl -sf http://127.0.0.1:8443/healthz
+
+      - name: Start escrow server (go)
+        if: matrix.server == 'go'
+        run: |
+          (cd server-go && go build -o /tmp/luksmith-server .)
+          /tmp/luksmith-server --db ci.db --port 8443 \
             --admin-token ci-admin --enroll-secret ci-enroll &
           sleep 1
           curl -sf http://127.0.0.1:8443/healthz
@@ -130,6 +150,41 @@ jobs:
           echo '{"disk_encrypted": true, "tpm_bound": true, "recovery_key_escrowed": true, "last_boot_class": "fallback_used"}' \
             | sudo tee /var/lib/luksmith/compliance.json
           sh integrations/intune/luksmith-discovery.sh | grep -q '"boot_healthy": false'
+
+  build-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luksmith-ui-dist
+          path: ui/dist
+
+  server-go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server-go/go.mod
+          cache-dependency-path: server-go/go.sum
+      - run: go vet ./...
+      - run: gofmt -l . && test -z "$(gofmt -l .)"
+      - run: go test ./...
+      - name: static cross-compile check
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /dev/null .
 
   docker:
     runs-on: ubuntu-latest

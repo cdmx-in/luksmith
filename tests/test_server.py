@@ -1,6 +1,7 @@
 """E2E tests for luksmith-server: real HTTP against a real sqlite store."""
 
 import base64
+import http.client
 import json
 import os
 import sys
@@ -148,6 +149,33 @@ class ServerTest(unittest.TestCase):
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
             self.assertIn("luksmith", resp.read().decode())
+
+    def test_static_refuses_path_traversal(self):
+        ui = os.path.join(self.tmp, "dist")
+        os.makedirs(ui, exist_ok=True)
+        with open(os.path.join(ui, "index.html"), "w") as f:
+            f.write("<title>luksmith ui</title>")
+        with open(os.path.join(self.tmp, "secret.txt"), "w") as f:
+            f.write("org-private-material")
+        luksmith_server.Handler.ui_dir = ui
+        try:
+            host, port = self.httpd.server_address
+            # http.client sends the path verbatim (urllib would normalize ..)
+            for evil in ("/../secret.txt", "/%2e%2e/secret.txt",
+                         "/assets/../../secret.txt"):
+                conn = http.client.HTTPConnection(host, port)
+                conn.request("GET", evil)
+                resp = conn.getresponse()
+                body = resp.read()
+                self.assertEqual(resp.status, 404, evil)
+                self.assertNotIn(b"org-private-material", body)
+                conn.close()
+            # sanity: index.html is served from inside ui_dir
+            with urllib.request.urlopen(self.base + "/") as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertIn("luksmith ui", resp.read().decode())
+        finally:
+            luksmith_server.Handler.ui_dir = None
 
 
 if __name__ == "__main__":

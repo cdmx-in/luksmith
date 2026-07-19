@@ -5,3 +5,5 @@ __pycache__/
 *.key
 disk.img
 .venv/
+ui/node_modules/
+ui/dist/
