@@ -268,6 +268,24 @@ jobs:
       - name: static cross-compile check
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /dev/null .
 
+  rhel-unit:
+    # Proves the agent imports and its unit tests pass on RHEL-family (Fedora),
+    # pinning dnf/distro compatibility. Chosen over a fedora-container swtpm
+    # lifecycle: the real TPM path needs a privileged container with loop
+    # devices (losetup) which is fragile in CI — the host-runner tpm-integration
+    # job already exercises the full swtpm enroll->verify->drift lifecycle, and
+    # the agent's TPM code is distro-agnostic (mode defaults + dracut-vs-initramfs
+    # is unit-tested here). Fedora 41 ships dracut, so the systemd native path
+    # is the default on this family.
+    runs-on: ubuntu-latest
+    container: fedora:41
+    steps:
+      - name: Install python3 + git
+        run: dnf install -y python3 git
+      - uses: actions/checkout@v4
+      - name: Unit tests on Fedora
+        run: python3 -m unittest discover -s tests -v
+
   docker:
     runs-on: ubuntu-latest
     steps:

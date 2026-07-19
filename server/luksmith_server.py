@@ -57,11 +57,70 @@ CREATE TABLE IF NOT EXISTS audit (
     device_id TEXT,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS admins (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
+    role TEXT NOT NULL,
+    sso_subject TEXT UNIQUE,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    role TEXT NOT NULL,
+    expires INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reveal_requests (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    key_id TEXT,
+    requester TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approver TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+);
 """
+
+ROLES = ("owner", "admin", "helpdesk", "auditor")
+# Capability -> roles that hold it. "view" (any authenticated admin) is implicit.
+PERMS = {
+    "request": {"owner", "admin", "helpdesk"},
+    "approve": {"owner", "admin"},
+    "rotate": {"owner", "admin"},
+    "manage": {"owner"},
+}
+ROLE_RANK = {"owner": 3, "admin": 2, "helpdesk": 1, "auditor": 0}
+PBKDF2_ITERS = 600000
+SESSION_TTL = 12 * 3600
+DECRYPT_HINT = ("base64 -d ciphertext.b64 | openssl pkeyutl -decrypt "
+                "-inkey org_private.pem -pkeyopt rsa_padding_mode:oaep "
+                "-pkeyopt rsa_oaep_md:sha256")
 
 
 def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
+
+
+def hash_password(pw, iters=PBKDF2_ITERS):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iters)
+    return f"pbkdf2_sha256${iters}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw, stored):
+    try:
+        _algo, iters, salt_hex, hash_hex = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex), int(iters))
+    except (ValueError, AttributeError):
+        return False
+    return hmac.compare_digest(dk.hex(), hash_hex)
+
+
+# One fixed hash so login runs pbkdf2 even for unknown users (timing/enumeration).
+DUMMY_HASH = hash_password("luksmith-nobody")
 
 
 def locked(method):
@@ -160,6 +219,117 @@ class Store:
         return self.db.execute(
             "SELECT * FROM audit ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
 
+    # ------------------------------------------------------- admins / RBAC
+    @locked
+    def get_admin(self, username):
+        return self.db.execute(
+            "SELECT * FROM admins WHERE username=?", (username,)).fetchone()
+
+    @locked
+    def create_admin(self, username, password, role):
+        self.db.execute(
+            "INSERT INTO admins (id, username, password_hash, role, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (secrets.token_hex(8), username, hash_password(password), role,
+             int(time.time())))
+        self.db.commit()
+
+    @locked
+    def list_admins(self):  # no password hashes
+        return self.db.execute(
+            "SELECT id, username, role, sso_subject, created_at FROM admins"
+            " ORDER BY username").fetchall()
+
+    @locked
+    def delete_admin(self, username):
+        row = self.db.execute(
+            "SELECT role FROM admins WHERE username=?", (username,)).fetchone()
+        if not row:
+            return False, "not found"
+        if row["role"] == "owner":
+            n = self.db.execute(
+                "SELECT COUNT(*) c FROM admins WHERE role='owner'").fetchone()["c"]
+            if n <= 1:
+                return False, "cannot remove the last owner"
+        self.db.execute("DELETE FROM admins WHERE username=?", (username,))
+        self.db.commit()
+        return True, None
+
+    @locked
+    def upsert_sso(self, email, role):
+        # ponytail: keyed on sso_subject; a username collision with a local
+        # admin of the same name is left to raise — SSO subjects are emails.
+        self.db.execute(
+            "INSERT INTO admins (id, username, password_hash, role, sso_subject, created_at)"
+            " VALUES (?,?,NULL,?,?,?)"
+            " ON CONFLICT(sso_subject) DO UPDATE SET role=excluded.role",
+            (secrets.token_hex(8), email, role, email, int(time.time())))
+        self.db.commit()
+
+    # ------------------------------------------------------- sessions
+    @locked
+    def create_session(self, username, role):
+        token = secrets.token_urlsafe(32)
+        expires = int(time.time()) + SESSION_TTL
+        self.db.execute(
+            "INSERT INTO sessions (token_hash, username, role, expires) VALUES (?,?,?,?)",
+            (sha256(token), username, role, expires))
+        self.db.commit()
+        return token, expires
+
+    @locked
+    def session(self, token):
+        row = self.db.execute(
+            "SELECT * FROM sessions WHERE token_hash=?", (sha256(token),)).fetchone()
+        return row if row and row["expires"] > int(time.time()) else None
+
+    @locked
+    def delete_session(self, token):
+        self.db.execute("DELETE FROM sessions WHERE token_hash=?", (sha256(token),))
+        self.db.commit()
+
+    # ------------------------------------------------------- reveal requests
+    @locked
+    def create_reveal_request(self, device_id, requester, reason):
+        rid = secrets.token_hex(8)
+        self.db.execute(
+            "INSERT INTO reveal_requests (id, device_id, requester, reason, status, created_at)"
+            " VALUES (?,?,?,?,'pending',?)",
+            (rid, device_id, requester, reason, int(time.time())))
+        self.db.commit()
+        return rid
+
+    @locked
+    def get_reveal_request(self, rid):
+        return self.db.execute(
+            "SELECT * FROM reveal_requests WHERE id=?", (rid,)).fetchone()
+
+    @locked
+    def list_reveal_requests(self, status=None):
+        if status and status != "all":
+            return self.db.execute(
+                "SELECT * FROM reveal_requests WHERE status=? ORDER BY created_at DESC",
+                (status,)).fetchall()
+        return self.db.execute(
+            "SELECT * FROM reveal_requests ORDER BY created_at DESC").fetchall()
+
+    @locked
+    def decide_reveal_request(self, rid, approver, status):
+        cur = self.db.execute(
+            "UPDATE reveal_requests SET status=?, approver=?, decided_at=?"
+            " WHERE id=? AND status='pending'",
+            (status, approver, int(time.time()), rid))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    @locked
+    def consume_reveal_request(self, rid, key_id):
+        cur = self.db.execute(
+            "UPDATE reveal_requests SET status='consumed', key_id=?"
+            " WHERE id=? AND status='approved'", (key_id, rid))
+        self.db.commit()
+        return cur.rowcount > 0
+
 
 DASHBOARD = """<!doctype html><meta charset="utf-8">
 <title>luksmith</title>
@@ -192,6 +362,11 @@ class Handler(BaseHTTPRequestHandler):
     admin_token = None
     enroll_secret = None
     ui_dir = None  # built React UI (ui/dist); None -> inline dashboard fallback
+    require_approval = False
+    trust_proxy = False
+    proxy_secret = None
+    sso_group_map = {"luksmith-owners": "owner", "luksmith-admins": "admin",
+                     "luksmith-auditors": "auditor"}
 
     # ------------------------------------------------------------- helpers
     def send(self, code, body, ctype="application/json"):
@@ -216,26 +391,56 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         return auth[7:] if auth.startswith("Bearer ") else None
 
-    def is_admin(self):
+    def map_role(self, groups_header):
+        matched = [self.sso_group_map[g.strip()] for g in groups_header.split(",")
+                   if g.strip() in self.sso_group_map]
+        return max(matched, key=ROLE_RANK.get) if matched else "helpdesk"
+
+    def identity(self):
+        """Resolve the caller per the contract's auth order; None -> 401."""
+        auth = self.headers.get("Authorization", "")
         tok = self.bearer()
         if tok and hmac.compare_digest(tok, self.admin_token):
-            return True
-        basic = self.headers.get("Authorization", "")
-        if basic.startswith("Basic "):
+            return {"username": "root-token", "role": "owner", "sso": False}
+        if tok:
+            sess = self.store.session(tok)
+            if sess:
+                return {"username": sess["username"], "role": sess["role"], "sso": False}
+        if auth.startswith("Basic "):
             try:
-                _, _, pw = base64.b64decode(basic[6:]).decode().partition(":")
-                return hmac.compare_digest(pw, self.admin_token)
+                _, _, pw = base64.b64decode(auth[6:]).decode().partition(":")
             except Exception:
-                return False
-        return False
+                pw = ""
+            if pw and hmac.compare_digest(pw, self.admin_token):
+                return {"username": "root-token", "role": "owner", "sso": False}
+        if self.trust_proxy and self.proxy_secret:
+            sent = self.headers.get("X-Proxy-Secret", "")
+            if hmac.compare_digest(sent, self.proxy_secret):
+                email = self.headers.get("X-Auth-Request-Email", "").strip()
+                if email:
+                    role = self.map_role(self.headers.get("X-Auth-Request-Groups", ""))
+                    self.store.upsert_sso(email, role)
+                    return {"username": email, "role": role, "sso": True}
+        return None
 
     def need_admin(self):
-        if self.is_admin():
-            return True
+        ident = self.identity()
+        if ident:
+            return ident
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="luksmith"')
         self.end_headers()
-        return False
+        return None
+
+    def require(self, cap):
+        """need_admin plus a capability gate (cap=None -> any authenticated)."""
+        ident = self.need_admin()
+        if not ident:
+            return None
+        if cap and ident["role"] not in PERMS[cap]:
+            self.send(403, {"error": "forbidden: role %s lacks %s" % (ident["role"], cap)})
+            return None
+        return ident
 
     def agent_device(self):
         tok = self.bearer()
@@ -270,6 +475,21 @@ class Handler(BaseHTTPRequestHandler):
             if not self.need_admin():
                 return
             return self.send(200, {"audit": [dict(r) for r in self.store.audit_log()]})
+        if path == "/api/v1/me":
+            ident = self.need_admin()
+            if not ident:
+                return
+            return self.send(200, ident)
+        if path == "/api/v1/admins":
+            if not self.require("manage"):
+                return
+            return self.send(200, {"admins": [dict(r) for r in self.store.list_admins()]})
+        if path == "/api/v1/reveal-requests":
+            if not self.require(None):
+                return
+            status = parse_qs(urlparse(self.path).query).get("status", ["all"])[0]
+            return self.send(200, {"requests":
+                                   [dict(r) for r in self.store.list_reveal_requests(status)]})
         if self.serve_ui(path):
             return
         self.send(404, {"error": "not found"})
@@ -325,12 +545,54 @@ class Handler(BaseHTTPRequestHandler):
             rotate = self.store.checkin(dev["id"], self.body_json() or {})
             return self.send(200, {"rotate_requested": rotate})
 
+        if path == "/api/v1/auth/login":
+            body = self.body_json() or {}
+            username = str(body.get("username", ""))
+            password = str(body.get("password", ""))
+            row = self.store.get_admin(username)
+            stored = row["password_hash"] if row and row["password_hash"] else DUMMY_HASH
+            if not verify_password(password, stored) or not (row and row["password_hash"]):
+                return self.send(401, {"error": "bad credentials"})
+            token, expires = self.store.create_session(row["username"], row["role"])
+            return self.send(200, {"token": token, "username": row["username"],
+                                   "role": row["role"], "expires": expires})
+
+        if path == "/api/v1/auth/logout":
+            tok = self.bearer()
+            if tok:
+                self.store.delete_session(tok)
+            return self.send(200, {"ok": True})
+
+        if path == "/api/v1/admins":
+            ident = self.require("manage")
+            if not ident:
+                return
+            body = self.body_json() or {}
+            username = str(body.get("username", "")).strip()
+            password = str(body.get("password", ""))
+            role = str(body.get("role", ""))
+            if not username or not password or role not in ROLES:
+                return self.send(400, {"error": "username, password, and valid role required"})
+            try:
+                self.store.create_admin(username, password, role)
+            except sqlite3.IntegrityError:
+                return self.send(409, {"error": "username already exists"})
+            self.store.audit(ident["username"], "admin_created", None,
+                             "username=%s role=%s" % (username, role))
+            return self.send(200, {"username": username, "role": role})
+
+        if path.startswith("/api/v1/reveal-requests/"):
+            parts = path.split("/")
+            if len(parts) == 6:
+                return self.reveal_request_action(parts[4], parts[5])
+
         if path.startswith("/api/v1/keys/") and path.endswith("/rotate"):
-            if not self.need_admin():
+            ident = self.require("rotate")
+            if not ident:
                 return
             device_id = path.split("/")[4]
             self.store.request_rotate(device_id)
-            self.store.audit("admin", "rotate_requested", device_id)
+            self.store.audit(ident["username"], "rotate_requested", device_id)
             return self.send(200, {"rotate_requested": True})
 
         if path.endswith("/reveal") and \
@@ -340,8 +602,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, {"error": "not found"})
 
     def reveal(self, path):
-        """Key retrieval — admin only, reason mandatory, always audited."""
-        if not self.need_admin():
+        """Key retrieval — reason mandatory, always audited.
+
+        Needs the "request" capability. With --require-approval the JSON API
+        path creates a pending request (202) instead of returning ciphertext;
+        the dashboard (/keys/…) path stays immediate for the basic-auth owner.
+        """
+        ident = self.require("request")
+        if not ident:
             return
         device_id = path.split("/")[2] if path.startswith("/keys/") else \
             path.split("/")[4]
@@ -351,16 +619,18 @@ class Handler(BaseHTTPRequestHandler):
         reason = (qs.get("reason") or form.get("reason") or [""])[0].strip()
         if not reason:
             return self.send(400, {"error": "a reason is required and audited"})
+        if self.require_approval and path.startswith("/api/v1/keys/"):
+            rid = self.store.create_reveal_request(device_id, ident["username"], reason)
+            self.store.audit(ident["username"], "reveal_requested", device_id,
+                             f"reason={reason[:500]}")
+            return self.send(202, {"request_id": rid, "status": "pending"})
         row = self.store.active_key(device_id)
-        self.store.audit("admin", "key_revealed" if row else "key_reveal_miss",
+        self.store.audit(ident["username"], "key_revealed" if row else "key_reveal_miss",
                          device_id, f"reason={reason[:500]}")
         if not row:
             return self.send(404, {"error": "no active key for device"})
         payload = {"key_id": row["id"], "ciphertext": row["ciphertext"],
-                   "created_at": row["created_at"],
-                   "decrypt_hint": "base64 -d ciphertext.b64 | openssl pkeyutl -decrypt "
-                                   "-inkey org_private.pem -pkeyopt rsa_padding_mode:oaep "
-                                   "-pkeyopt rsa_oaep_md:sha256"}
+                   "created_at": row["created_at"], "decrypt_hint": DECRYPT_HINT}
         if path.startswith("/keys/"):  # dashboard form -> human-readable page
             body = ("<!doctype html><meta charset='utf-8'><body style='font:15px system-ui;"
                     "margin:2rem'><h2>Escrowed ciphertext for %s</h2><p>Retrieval audited "
@@ -371,6 +641,59 @@ class Handler(BaseHTTPRequestHandler):
                        html.escape(row["ciphertext"]), html.escape(payload["decrypt_hint"])))
             return self.send(200, body, "text/html; charset=utf-8")
         return self.send(200, payload)
+
+    def reveal_request_action(self, rid, action):
+        ident = self.need_admin()
+        if not ident:
+            return
+        req = self.store.get_reveal_request(rid)
+        if not req:
+            return self.send(404, {"error": "no such request"})
+        if action in ("approve", "deny"):
+            if ident["role"] not in PERMS["approve"]:
+                return self.send(403, {"error": "forbidden: role %s lacks approve"
+                                       % ident["role"]})
+            if req["requester"] == ident["username"]:
+                return self.send(403, {"error": "cannot approve your own request"})
+            status = "approved" if action == "approve" else "denied"
+            if not self.store.decide_reveal_request(rid, ident["username"], status):
+                return self.send(409, {"error": "request is not pending"})
+            self.store.audit(ident["username"], "reveal_" + status, req["device_id"],
+                             "request=%s requester=%s" % (rid, req["requester"]))
+            return self.send(200, {"id": rid, "status": status})
+        if action == "reveal":
+            if req["requester"] != ident["username"]:
+                return self.send(403, {"error": "only the requester may reveal"})
+            if req["status"] != "approved":
+                return self.send(409, {"error": "request is not approved"})
+            row = self.store.active_key(req["device_id"])
+            if not row:
+                return self.send(404, {"error": "no active key for device"})
+            if not self.store.consume_reveal_request(rid, row["id"]):
+                return self.send(409, {"error": "request is not approved"})
+            self.store.audit(ident["username"], "key_revealed", req["device_id"],
+                             "request=%s requester=%s approver=%s"
+                             % (rid, req["requester"], req["approver"]))
+            return self.send(200, {"key_id": row["id"], "ciphertext": row["ciphertext"],
+                                   "created_at": row["created_at"],
+                                   "decrypt_hint": DECRYPT_HINT})
+        return self.send(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/v1/admins/"):
+            ident = self.require("manage")
+            if not ident:
+                return
+            username = unquote(path.split("/")[4])
+            if username == "root-token":
+                return self.send(403, {"error": "cannot remove the built-in root-token"})
+            ok, err = self.store.delete_admin(username)
+            if not ok:
+                return self.send(404 if err == "not found" else 409, {"error": err})
+            self.store.audit(ident["username"], "admin_deleted", None, "username=%s" % username)
+            return self.send(200, {"deleted": username})
+        self.send(404, {"error": "not found"})
 
     def dashboard(self):
         rows = []
@@ -409,6 +732,15 @@ def main(argv=None):
     ap.add_argument("--ui-dir",
                     help="built UI assets to serve (default: ui/dist next to this "
                          "script, if present; else the inline dashboard)")
+    ap.add_argument("--require-approval", action="store_true",
+                    default=os.environ.get("LUKSMITH_REQUIRE_APPROVAL") in ("1", "true", "yes"),
+                    help="two-person reveal: requests need a different admin's approval")
+    ap.add_argument("--trust-proxy", action="store_true",
+                    help="honour X-Auth-Request-* headers when X-Proxy-Secret matches")
+    ap.add_argument("--proxy-shared-secret", default=os.environ.get("LUKSMITH_PROXY_SECRET"),
+                    help="shared secret a trusted reverse proxy sends in X-Proxy-Secret")
+    ap.add_argument("--sso-group-map", default=os.environ.get("LUKSMITH_SSO_GROUP_MAP"),
+                    help="group:role,... overrides added to the built-in defaults")
     args = ap.parse_args(argv)
 
     if not args.admin_token or not args.enroll_secret:
@@ -420,6 +752,16 @@ def main(argv=None):
     ui_dir = args.ui_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "ui", "dist")
     Handler.ui_dir = ui_dir if os.path.isdir(ui_dir) else None
+    Handler.require_approval = args.require_approval
+    Handler.trust_proxy = args.trust_proxy
+    Handler.proxy_secret = args.proxy_shared_secret
+    if args.sso_group_map:
+        gmap = dict(Handler.sso_group_map)
+        for pair in args.sso_group_map.split(","):
+            group, _, role = pair.partition(":")
+            if group.strip() and role.strip() in ROLES:
+                gmap[group.strip()] = role.strip()
+        Handler.sso_group_map = gmap
 
     httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
     scheme = "http"

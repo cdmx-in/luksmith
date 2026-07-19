@@ -11,7 +11,13 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
+
+func envBool(name string) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
 
 func main() {
 	db := flag.String("db", "luksmith.db", "sqlite database path")
@@ -24,6 +30,14 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "TLS certificate (PEM); omit only behind a reverse proxy")
 	tlsKey := flag.String("tls-key", "", "TLS private key (PEM)")
 	uiDir := flag.String("ui-dir", "", "static SPA directory served at / (built-in dashboard if unset)")
+	requireApproval := flag.Bool("require-approval", envBool("LUKSMITH_REQUIRE_APPROVAL"),
+		"two-person reveal: file a request that another admin must approve (env LUKSMITH_REQUIRE_APPROVAL=1)")
+	trustProxy := flag.Bool("trust-proxy", false,
+		"trust X-Auth-Request-* SSO headers when X-Proxy-Secret matches --proxy-shared-secret")
+	proxySecret := flag.String("proxy-shared-secret", os.Getenv("LUKSMITH_PROXY_SECRET"),
+		"shared secret the auth proxy must send in X-Proxy-Secret (env LUKSMITH_PROXY_SECRET)")
+	ssoGroupMap := flag.String("sso-group-map", "",
+		"SSO group→role map, \"group:role,...\" (defaults: luksmith-owners/-admins/-auditors)")
 	flag.Parse()
 
 	if *adminToken == "" || *enrollSecret == "" {
@@ -35,7 +49,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	handler := newHandler(store, *adminToken, *enrollSecret, *uiDir)
+	handler := newHandler(store, *adminToken, *enrollSecret, *uiDir, adminConfig{
+		requireApproval: *requireApproval,
+		trustProxy:      *trustProxy,
+		proxySecret:     *proxySecret,
+		ssoGroupMap:     *ssoGroupMap,
+	})
 	addr := net.JoinHostPort(*bind, strconv.Itoa(*port))
 
 	scheme := "http"

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -27,16 +28,33 @@ type server struct {
 	adminToken   string
 	enrollSecret string
 	uiDir        string // "" -> minimal built-in dashboard
+
+	requireApproval bool
+	trustProxy      bool
+	proxySecret     string
+	groupMap        map[string]string
 }
 
-func newHandler(store *Store, adminToken, enrollSecret, uiDir string) http.Handler {
+// adminConfig carries the RBAC/SSO/two-person flags into newHandler.
+type adminConfig struct {
+	requireApproval bool
+	trustProxy      bool
+	proxySecret     string
+	ssoGroupMap     string // raw "group:role,..."
+}
+
+func newHandler(store *Store, adminToken, enrollSecret, uiDir string, cfg adminConfig) http.Handler {
 	if uiDir != "" {
 		if st, err := os.Stat(uiDir); err != nil || !st.IsDir() {
 			fmt.Fprintf(os.Stderr, "WARNING: --ui-dir %q missing; serving built-in dashboard\n", uiDir)
 			uiDir = ""
 		}
 	}
-	s := &server{store: store, adminToken: adminToken, enrollSecret: enrollSecret, uiDir: uiDir}
+	s := &server{
+		store: store, adminToken: adminToken, enrollSecret: enrollSecret, uiDir: uiDir,
+		requireApproval: cfg.requireApproval, trustProxy: cfg.trustProxy,
+		proxySecret: cfg.proxySecret, groupMap: parseGroupMap(cfg.ssoGroupMap),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 200, map[string]any{"ok": true})
@@ -46,9 +64,22 @@ func newHandler(store *Store, adminToken, enrollSecret, uiDir string) http.Handl
 	mux.HandleFunc("POST /api/v1/devices/{id}/checkin", s.checkin)
 	mux.HandleFunc("POST /api/v1/keys/{id}/rotate", s.rotate)
 	mux.HandleFunc("POST /api/v1/keys/{id}/reveal", s.reveal)
-	mux.HandleFunc("POST /keys/{id}/reveal", s.reveal)
+	mux.HandleFunc("POST /keys/{id}/reveal", s.revealDirect)
 	mux.HandleFunc("GET /api/v1/devices", s.listDevices)
 	mux.HandleFunc("GET /api/v1/audit", s.auditLog)
+
+	// Admin identity layer.
+	mux.HandleFunc("POST /api/v1/auth/login", s.login)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
+	mux.HandleFunc("GET /api/v1/me", s.me)
+	mux.HandleFunc("GET /api/v1/admins", s.listAdmins)
+	mux.HandleFunc("POST /api/v1/admins", s.createAdmin)
+	mux.HandleFunc("DELETE /api/v1/admins/{username}", s.deleteAdmin)
+	mux.HandleFunc("GET /api/v1/reveal-requests", s.listRevealRequests)
+	mux.HandleFunc("POST /api/v1/reveal-requests/{id}/approve", s.decideReveal("approved"))
+	mux.HandleFunc("POST /api/v1/reveal-requests/{id}/deny", s.decideReveal("denied"))
+	mux.HandleFunc("POST /api/v1/reveal-requests/{id}/reveal", s.revealConsume)
+
 	mux.HandleFunc("/", s.root) // catch-all: static UI / dashboard / 404
 	return mux
 }
@@ -84,23 +115,52 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
-func (s *server) isAdmin(r *http.Request) bool {
-	if tok := bearer(r); tok != "" && ctEq(tok, s.adminToken) {
-		return true
+// resolve applies the auth order from the contract, returning the caller's
+// principal or nil (unauthenticated). Only DB failures return an error.
+func (s *server) resolve(r *http.Request) (*principal, error) {
+	if tok := bearer(r); tok != "" {
+		if ctEq(tok, s.adminToken) { // 1. master token
+			return &principal{username: "root-token", role: roleOwner}, nil
+		}
+		p, ok, err := s.store.SessionByToken(tok) // 2. live session
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return p, nil
+		}
 	}
-	if _, pw, ok := r.BasicAuth(); ok && ctEq(pw, s.adminToken) {
-		return true
+	if _, pw, ok := r.BasicAuth(); ok && ctEq(pw, s.adminToken) { // 3. basic master
+		return &principal{username: "root-token", role: roleOwner}, nil
 	}
-	return false
+	// 4. trusted proxy — headers are ignored unless the shared secret matches.
+	if s.trustProxy && s.proxySecret != "" && ctEq(r.Header.Get("X-Proxy-Secret"), s.proxySecret) {
+		if email := strings.TrimSpace(r.Header.Get("X-Auth-Request-Email")); email != "" {
+			role := mapGroups(s.groupMap, r.Header.Get("X-Auth-Request-Groups"))
+			return s.store.UpsertSSOAdmin(email, role)
+		}
+	}
+	return nil, nil
+}
+
+// authed resolves the caller or writes 401; view-level (any valid role).
+func (s *server) authed(w http.ResponseWriter, r *http.Request) (*principal, bool) {
+	p, err := s.resolve(r)
+	if err != nil {
+		fail(w, err)
+		return nil, false
+	}
+	if p == nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="luksmith"`)
+		w.WriteHeader(401)
+		return nil, false
+	}
+	return p, true
 }
 
 func (s *server) needAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if s.isAdmin(r) {
-		return true
-	}
-	w.Header().Set("WWW-Authenticate", `Basic realm="luksmith"`)
-	w.WriteHeader(401)
-	return false
+	_, ok := s.authed(w, r)
+	return ok
 }
 
 // agentDevice returns the device id for a valid Bearer device token.
@@ -208,7 +268,12 @@ func (s *server) checkin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) rotate(w http.ResponseWriter, r *http.Request) {
-	if !s.needAdmin(w, r) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	if !canRotate(p.role) {
+		jsonErr(w, 403, "forbidden")
 		return
 	}
 	deviceID := r.PathValue("id")
@@ -216,20 +281,15 @@ func (s *server) rotate(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	if err := s.store.Audit("admin", "rotate_requested", deviceID, ""); err != nil {
+	if err := s.store.Audit(p.username, "rotate_requested", deviceID, ""); err != nil {
 		fail(w, err)
 		return
 	}
 	jsonResp(w, 200, map[string]bool{"rotate_requested": true})
 }
 
-// reveal — admin only, reason mandatory, always audited. Serves both
-// /api/v1/keys/{id}/reveal and /keys/{id}/reveal (React UI displays it now).
-func (s *server) reveal(w http.ResponseWriter, r *http.Request) {
-	if !s.needAdmin(w, r) {
-		return
-	}
-	deviceID := r.PathValue("id")
+// revealReason reads the mandatory reason from ?reason= or a form body.
+func revealReason(r *http.Request) string {
 	reason := strings.TrimSpace(r.URL.Query().Get("reason"))
 	if reason == "" {
 		b, _ := io.ReadAll(io.LimitReader(r.Body, 1_000_000))
@@ -237,10 +297,65 @@ func (s *server) reveal(w http.ResponseWriter, r *http.Request) {
 			reason = strings.TrimSpace(form.Get("reason"))
 		}
 	}
+	return reason
+}
+
+// revealPrep authenticates, checks the "request" permission and the mandatory
+// reason shared by both reveal entry points.
+func (s *server) revealPrep(w http.ResponseWriter, r *http.Request) (p *principal, deviceID, reason string, ok bool) {
+	p, ok = s.authed(w, r)
+	if !ok {
+		return nil, "", "", false
+	}
+	if !canRequest(p.role) {
+		jsonErr(w, 403, "forbidden")
+		return nil, "", "", false
+	}
+	deviceID = r.PathValue("id")
+	reason = revealReason(r)
 	if reason == "" {
 		jsonErr(w, 400, "a reason is required and audited")
+		return nil, "", "", false
+	}
+	return p, deviceID, reason, true
+}
+
+// reveal — the JSON API path /api/v1/keys/{id}/reveal. With --require-approval
+// off it returns the ciphertext immediately (back-compat); with it on it files
+// a pending two-person request (202) instead.
+func (s *server) reveal(w http.ResponseWriter, r *http.Request) {
+	p, deviceID, reason, ok := s.revealPrep(w, r)
+	if !ok {
 		return
 	}
+	if s.requireApproval {
+		reqID, err := s.store.CreateRevealRequest(deviceID, p.username, truncRunes(reason, 500))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if err := s.store.Audit(p.username, "reveal_requested", deviceID,
+			"reason="+truncRunes(reason, 500)); err != nil {
+			fail(w, err)
+			return
+		}
+		jsonResp(w, 202, map[string]any{"request_id": reqID, "status": "pending"})
+		return
+	}
+	s.revealImmediate(w, p, deviceID, reason)
+}
+
+// revealDirect — the dashboard path /keys/{id}/reveal. Always immediate, even
+// with --require-approval on (a Basic-auth owner viewing the built-in dashboard).
+func (s *server) revealDirect(w http.ResponseWriter, r *http.Request) {
+	p, deviceID, reason, ok := s.revealPrep(w, r)
+	if !ok {
+		return
+	}
+	s.revealImmediate(w, p, deviceID, reason)
+}
+
+func (s *server) revealImmediate(w http.ResponseWriter, p *principal, deviceID, reason string) {
 	keyID, ciphertext, createdAt, found, err := s.store.ActiveKey(deviceID)
 	if err != nil {
 		fail(w, err)
@@ -250,7 +365,7 @@ func (s *server) reveal(w http.ResponseWriter, r *http.Request) {
 	if found {
 		action = "key_revealed"
 	}
-	if err := s.store.Audit("admin", action, deviceID, "reason="+truncRunes(reason, 500)); err != nil {
+	if err := s.store.Audit(p.username, action, deviceID, "reason="+truncRunes(reason, 500)); err != nil {
 		fail(w, err)
 		return
 	}
@@ -306,6 +421,295 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResp(w, 200, map[string]any{"audit": rows})
+}
+
+// -------------------------------------------------------------- admin identity
+
+func (s *server) login(w http.ResponseWriter, r *http.Request) {
+	body := bodyJSON(r)
+	username, _ := body["username"].(string)
+	password, _ := body["password"].(string)
+	_, hash, role, found, err := s.store.AdminByUsername(username)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	// Always run one pbkdf2 verify (against a dummy hash for unknown/SSO-only
+	// users) so timing does not reveal whether the username exists.
+	stored := dummyHash
+	if found && hash != "" {
+		stored = hash
+	}
+	if !verifyPassword(password, stored) || !found || hash == "" {
+		jsonErr(w, 401, "invalid credentials")
+		return
+	}
+	token, expires, err := s.store.CreateSession(username, role, 12*time.Hour)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	jsonResp(w, 200, map[string]any{
+		"token": token, "username": username, "role": role, "expires": expires})
+}
+
+func (s *server) logout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authed(w, r); !ok {
+		return
+	}
+	if tok := bearer(r); tok != "" {
+		if err := s.store.DeleteSession(tok); err != nil {
+			fail(w, err)
+			return
+		}
+	}
+	jsonResp(w, 200, map[string]any{"ok": true})
+}
+
+func (s *server) me(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	jsonResp(w, 200, map[string]any{"username": p.username, "role": p.role, "sso": p.sso})
+}
+
+func (s *server) listAdmins(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	if !canManageAdmins(p.role) {
+		jsonErr(w, 403, "forbidden")
+		return
+	}
+	rows, err := s.store.Admins()
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, a := range rows {
+		out = append(out, map[string]any{
+			"id": a.ID, "username": a.Username, "role": a.Role, "sso": a.SSO})
+	}
+	jsonResp(w, 200, map[string]any{"admins": out})
+}
+
+func (s *server) createAdmin(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	if !canManageAdmins(p.role) {
+		jsonErr(w, 403, "forbidden")
+		return
+	}
+	body := bodyJSON(r)
+	username, _ := body["username"].(string)
+	password, _ := body["password"].(string)
+	role, _ := body["role"].(string)
+	username = strings.TrimSpace(username)
+	if username == "" || password == "" || !validRole(role) {
+		jsonErr(w, 400, "username, password and a valid role are required")
+		return
+	}
+	if username == "root-token" {
+		jsonErr(w, 409, "username is reserved")
+		return
+	}
+	if _, _, _, exists, err := s.store.AdminByUsername(username); err != nil {
+		fail(w, err)
+		return
+	} else if exists {
+		jsonErr(w, 409, "username already exists")
+		return
+	}
+	if err := s.store.CreateAdmin(username, hashPassword(password), role); err != nil {
+		fail(w, err)
+		return
+	}
+	if err := s.store.Audit(p.username, "admin_created", "",
+		"username="+username+" role="+role); err != nil {
+		fail(w, err)
+		return
+	}
+	jsonResp(w, 200, map[string]any{"username": username, "role": role})
+}
+
+func (s *server) deleteAdmin(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	if !canManageAdmins(p.role) {
+		jsonErr(w, 403, "forbidden")
+		return
+	}
+	username := r.PathValue("username")
+	if username == "root-token" {
+		jsonErr(w, 403, "cannot remove the built-in root-token")
+		return
+	}
+	_, _, role, found, err := s.store.AdminByUsername(username)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if !found {
+		jsonErr(w, 404, "no such admin")
+		return
+	}
+	if role == roleOwner {
+		n, err := s.store.CountOwners()
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if n <= 1 {
+			jsonErr(w, 409, "cannot remove the last owner")
+			return
+		}
+	}
+	if _, err := s.store.DeleteAdmin(username); err != nil {
+		fail(w, err)
+		return
+	}
+	if err := s.store.Audit(p.username, "admin_deleted", "", "username="+username); err != nil {
+		fail(w, err)
+		return
+	}
+	jsonResp(w, 200, map[string]any{"deleted": username})
+}
+
+// -------------------------------------------------------------- reveal requests
+
+func revealRequestJSON(r RevealRequest) map[string]any {
+	m := map[string]any{
+		"id": r.ID, "device_id": r.DeviceID, "requester": r.Requester,
+		"reason": r.Reason, "status": r.Status, "created_at": r.CreatedAt,
+		"key_id": nil, "approver": nil, "decided_at": nil,
+	}
+	if r.KeyID.Valid {
+		m["key_id"] = r.KeyID.String
+	}
+	if r.Approver.Valid {
+		m["approver"] = r.Approver.String
+	}
+	if r.DecidedAt.Valid {
+		m["decided_at"] = r.DecidedAt.Int64
+	}
+	return m
+}
+
+func (s *server) listRevealRequests(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authed(w, r); !ok {
+		return
+	}
+	// Parity with the Python server: default (no param) and ?status=all list
+	// every request; only ?status=pending narrows to pending.
+	pendingOnly := r.URL.Query().Get("status") == "pending"
+	rows, err := s.store.ListRevealRequests(pendingOnly)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, rq := range rows {
+		out = append(out, revealRequestJSON(rq))
+	}
+	jsonResp(w, 200, map[string]any{"requests": out})
+}
+
+// decideReveal handles approve/deny: owner/admin, never the requester.
+func (s *server) decideReveal(status string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p, ok := s.authed(w, r)
+		if !ok {
+			return
+		}
+		if !canApprove(p.role) {
+			jsonErr(w, 403, "forbidden")
+			return
+		}
+		id := r.PathValue("id")
+		rq, found, err := s.store.RevealRequest(id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if !found {
+			jsonErr(w, 404, "no such request")
+			return
+		}
+		if rq.Requester == p.username {
+			jsonErr(w, 403, "a request may not be decided by its requester")
+			return
+		}
+		if err := s.store.DecideRevealRequest(id, p.username, status); err != nil {
+			if errors.Is(err, errNotPending) {
+				jsonErr(w, 409, "request is not pending")
+				return
+			}
+			fail(w, err)
+			return
+		}
+		action := "reveal_approved"
+		if status == "denied" {
+			action = "reveal_denied"
+		}
+		if err := s.store.Audit(p.username, action, rq.DeviceID,
+			"request="+id+" requester="+rq.Requester); err != nil {
+			fail(w, err)
+			return
+		}
+		jsonResp(w, 200, map[string]any{"request_id": id, "status": status})
+	}
+}
+
+// revealConsume returns the ciphertext for an approved request; only the
+// requester may call it, and only once.
+func (s *server) revealConsume(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.authed(w, r)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	rq, found, err := s.store.RevealRequest(id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if !found {
+		jsonErr(w, 404, "no such request")
+		return
+	}
+	if rq.Requester != p.username {
+		jsonErr(w, 403, "only the requester may reveal")
+		return
+	}
+	keyID, ciphertext, createdAt, err := s.store.ConsumeRevealRequest(id)
+	if err != nil {
+		switch {
+		case errors.Is(err, errNotApproved):
+			jsonErr(w, 409, "request is not approved")
+		case errors.Is(err, errNoActiveKey):
+			s.store.Audit(p.username, "key_reveal_miss", rq.DeviceID, "request_id="+id)
+			jsonErr(w, 404, "no active key for device")
+		default:
+			fail(w, err)
+		}
+		return
+	}
+	detail := fmt.Sprintf("request=%s requester=%s approver=%s",
+		id, rq.Requester, rq.Approver.String)
+	if err := s.store.Audit(p.username, "key_revealed", rq.DeviceID, detail); err != nil {
+		fail(w, err)
+		return
+	}
+	jsonResp(w, 200, map[string]any{
+		"key_id": keyID, "ciphertext": ciphertext,
+		"created_at": createdAt, "decrypt_hint": decryptHint})
 }
 
 // root is the catch-all: static SPA (with index.html fallback) when --ui-dir

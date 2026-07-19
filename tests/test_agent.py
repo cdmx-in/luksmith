@@ -287,5 +287,67 @@ class TestFwupdParse(unittest.TestCase):
                          [{"device": "System Firmware", "update": "1.2"}])
 
 
+class TestDistro(unittest.TestCase):
+    OS_RELEASE = {
+        'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\n': "debian",
+        'ID=fedora\nVERSION_ID=41\n': "rhel",
+        'ID="rhel"\nID_LIKE="fedora"\n': "rhel",
+        'ID="rocky"\nID_LIKE="rhel centos fedora"\n': "rhel",
+        'ID="almalinux"\nID_LIKE="rhel centos fedora"\n': "rhel",
+    }
+
+    def test_distro_family_parsing(self):
+        for data, expected in self.OS_RELEASE.items():
+            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
+                self.assertEqual(luksmith.distro_family(), expected, data)
+
+    def test_os_release_missing_defaults_debian(self):
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertEqual(luksmith.distro_family(), "debian")
+
+    def test_default_mode_by_family(self):
+        with mock.patch.object(luksmith, "distro_family", return_value="rhel"):
+            self.assertEqual(luksmith.default_mode(), "systemd")
+        with mock.patch.object(luksmith, "distro_family", return_value="debian"):
+            self.assertEqual(luksmith.default_mode(), "clevis")
+
+    def test_systemd_bind_on_rhel_regenerates_via_dracut_not_initramfs(self):
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]), \
+                mock.patch.object(luksmith, "distro_family", return_value="rhel"):
+            luksmith.tpm_bind("/dev/x", "systemd", "7", None)
+        cmds = [c[0] for c in calls]
+        self.assertIn("dracut", cmds)
+        self.assertNotIn("update-initramfs", cmds)
+
+    def test_clevis_bind_on_rhel_skips_tss_hook_and_initramfs(self):
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]), \
+                mock.patch.object(luksmith, "distro_family", return_value="rhel"), \
+                mock.patch.object(luksmith, "install_tss_hook") as hook, \
+                mock.patch.object(luksmith.shutil, "which", return_value="/usr/bin/clevis"):
+            luksmith.tpm_bind("/dev/x", "clevis", "7", None)
+        hook.assert_not_called()
+        cmds = [c[0] for c in calls]
+        self.assertNotIn("update-initramfs", cmds)
+        self.assertIn("dracut", cmds)
+
+    def test_debian_systemd_bind_regenerates_nothing(self):
+        # backward compat: systemd mode on Debian never touched the initramfs.
+        calls = []
+        with mock.patch.object(
+                luksmith, "run",
+                side_effect=lambda cmd, **kw: (calls.append(cmd), proc(""))[1]), \
+                mock.patch.object(luksmith, "distro_family", return_value="debian"):
+            luksmith.tpm_bind("/dev/x", "systemd", "7", None)
+        cmds = [c[0] for c in calls]
+        self.assertNotIn("dracut", cmds)
+        self.assertNotIn("update-initramfs", cmds)
+
+
 if __name__ == "__main__":
     unittest.main()

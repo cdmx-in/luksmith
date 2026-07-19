@@ -84,6 +84,27 @@ jobs:
           luksmith status
           systemctl is-enabled luksmith-verify.timer
 
+      - name: Build .rpm (Fedora container for native systemd macros)
+        run: |
+          set -eux
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker run --rm -v "$PWD":/src -w /src fedora:41 bash -euxc '
+            dnf install -y rpm-build systemd-rpm-macros >/dev/null
+            V="'"$VERSION"'"
+            sed -i "s/^Version:.*/Version:        $V/" packaging/luksmith.spec
+            mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
+            stage="luksmith-$V"
+            mkdir -p "/tmp/$stage/agent" "/tmp/$stage/packaging"
+            cp agent/luksmith.py "/tmp/$stage/agent/"
+            cp packaging/luksmith-verify.service packaging/luksmith-verify.timer \
+               packaging/luksmith.spec "/tmp/$stage/packaging/"
+            tar -czf ~/rpmbuild/SOURCES/"$stage.tar.gz" -C /tmp "$stage"
+            rpmbuild -bb packaging/luksmith.spec
+            cp ~/rpmbuild/RPMS/noarch/luksmith-*.noarch.rpm /src/
+            rpm -qlp /src/luksmith-*.noarch.rpm
+          '
+          cp luksmith-"$VERSION"-1*.noarch.rpm luksmith.rpm
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,7 +112,8 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "luksmith $GITHUB_REF_NAME" \
             --generate-notes \
-            luksmith_*_all.deb luksmith.deb agent/luksmith.py install.sh \
+            luksmith_*_all.deb luksmith.deb luksmith-*.noarch.rpm luksmith.rpm \
+            agent/luksmith.py install.sh \
             luksmith-server-linux-amd64 luksmith-server-linux-arm64 luksmith-ui.tar.gz
 
       # Releases created with GITHUB_TOKEN never fire `release: published`

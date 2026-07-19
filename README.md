@@ -91,6 +91,8 @@ sudo luksmith enroll --server https://YOUR-PORTAL:8443 \
 
 Updates then arrive via normal `sudo apt upgrade`. Alternatives: grab `luksmith.deb` straight from [releases](https://github.com/cdmx-in/luksmith/releases) (`sudo apt install ./luksmith.deb`), or `sudo ./install.sh` from a checkout.
 
+**Fedora / RHEL / Rocky / AlmaLinux:** install the RPM from [releases](https://github.com/cdmx-in/luksmith/releases) (`sudo dnf install ./luksmith-*.noarch.rpm`) or build it from a checkout with `rpmbuild -bb packaging/luksmith.spec`. luksmith auto-detects the distro and defaults to `--mode systemd` there (RHEL-family ships dracut, so the native TPM path works with no clevis workaround), running `dracut --force` after enrollment so the token is picked up next boot.
+
 Enroll prompts once for the existing LUKS passphrase, then: recovery key created → escrowed → TPM auto-unlock bound → PCR baseline stored. Next reboot: no passphrase prompt.
 
 **Recovering a machine** (lost laptop, departed employee, broken TPM): click *Reveal* in the portal (reason mandatory, audited), decrypt on the admin workstation with `org_private.pem`, type the recovery key at the normal boot prompt.
@@ -103,13 +105,34 @@ Intune can't hold the key, but it can *enforce that escrow happened*:
 2. Attach [`luksmith-compliance-rules.json`](integrations/intune/luksmith-compliance-rules.json) to a compliance policy.
 3. Devices without an escrowed key go non-compliant → Conditional Access does the rest. Helpdesk pivots from the Intune device page to your luksmith portal for the actual key.
 
+#### Recovery-key pointer in Intune device notes
+
+Intune can't *store* the Linux key, but it can point to it. [`integrations/intune/luksmith-graph-notes.py`](integrations/intune/luksmith-graph-notes.py) stamps a **pointer** — the portal deep-link (`https://PORTAL/#device=<id>`) plus escrow key id — into each device's writable `managedDevice.notes` field via the beta Graph API, so helpdesk can pivot from the Intune device page straight to the portal. The key and ciphertext never leave the portal.
+
+```sh
+python integrations/intune/luksmith-graph-notes.py \
+    --from-portal https://YOUR-PORTAL:8443 --portal-token "$LUKSMITH_ADMIN_TOKEN"
+```
+
+Requires an Entra app with `DeviceManagementManagedDevices.ReadWrite.All` (application permission, admin-consented); auth is client-credentials OAuth2. The pointer lives in an idempotent `[luksmith]…[/luksmith]` block so re-runs update in place; `--dry-run` previews without calling Graph. See [`integrations/intune/README-graph.md`](integrations/intune/README-graph.md).
+
+## Portal admin accounts, roles & approvals
+
+The master `--admin-token` still works as a superuser, but the portal also supports named admin accounts with roles, SSO, and two-person key release:
+
+- **Roles:** `owner` (manage admins + everything), `admin` (rotate, request + approve reveals), `helpdesk` (request reveals only), `auditor` (read-only devices + audit log). Create accounts in the UI's **Admins** tab or `POST /api/v1/admins`.
+- **SSO:** put the portal behind an auth proxy (oauth2-proxy / Authelia). With `--trust-proxy` + `--proxy-shared-secret`, luksmith maps the proxy-asserted email and groups to a role (`--sso-group-map`) — any IdP, no OIDC code in the server. Proxy headers are ignored unless the shared secret matches.
+- **Two-person release:** with `--require-approval`, a reveal becomes a *request* — a second admin (never the requester) must approve it in the **Approvals** tab before the key is shown. Every request, approval, denial, and release is audited with both parties named.
+
 ## TPM modes
 
 | Mode | When | How |
 |---|---|---|
-| `--mode clevis` (default) | Stock Ubuntu 22.04/24.04 (GRUB + initramfs-tools) | `clevis luks bind` on PCR 7 + the `tss`-user initramfs hook luksmith installs (works around the packaging gap that breaks TPM at early boot) |
-| `--mode systemd` | dracut installs, Ubuntu ≥25.10, or non-root data volumes | Native `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7` |
+| `--mode clevis` | Default on Debian/Ubuntu (GRUB + initramfs-tools) | `clevis luks bind` on PCR 7 + the `tss`-user initramfs hook luksmith installs (works around the packaging gap that breaks TPM at early boot) |
+| `--mode systemd` | Default on Fedora/RHEL (dracut); also Ubuntu ≥25.10 or non-root data volumes | Native `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7` |
 | `--no-tpm` | Servers/VMs without TPM, or escrow-only rollouts | Recovery key + escrow only; passphrase prompt remains |
+
+The default follows the distro (`/etc/os-release`); `--mode` always overrides.
 
 PCR policy is **7 only** (Secure Boot certificates) by default — routine kernel/GRUB updates don't change it, so no recovery prompts after `apt upgrade`. What *does* change it (Secure Boot toggles, dbx/firmware updates): `luksmith check-updates` flags pending fwupd updates marked `affects-fde` before you reboot, and `verify` re-binds automatically after (pass `--unlock-key-file` to let it rebind from scratch when the old binding can't unseal at all).
 
@@ -144,14 +167,11 @@ A set `TPM2TOOLS_TCTI` counts as a present TPM — tpm2-tools and clevis honor i
 
 ## What CI proves
 
-Every push exercises the full chain on a real LUKS2 volume — against **both** portal implementations: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`) → admin-triggered rotation → **the old key no longer opens it, the new one does**. A separate job runs the **complete TPM lifecycle against a software TPM (swtpm)**: clevis enroll → verified TPM unlock → PCR 7 extended to simulate a firmware update → drift detected → automatic re-bind → verified TPM unlock again. Plus unit tests on Python 3.10/3.12, Go tests, the Intune discovery script against fixture data, shellcheck, the UI build, and a Docker image build with live health check.
+Every push exercises the full chain on a real LUKS2 volume — against **both** portal implementations: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`) → admin-triggered rotation → **the old key no longer opens it, the new one does**. A separate job runs the **complete TPM lifecycle against a software TPM (swtpm)**: clevis enroll → verified TPM unlock → PCR 7 extended to simulate a firmware update → drift detected → automatic re-bind → verified TPM unlock again. Plus unit tests on Python 3.10/3.12, the agent suite on a Fedora container, Go tests (RBAC + escrow, matching the Python server), the Intune discovery script against fixture data, shellcheck, the UI build, and a Docker image build with live health check.
 
 ## Roadmap
 
 - [ ] `systemd-pcrlock` support once usable on shipped Ubuntu (≥25.10/26.04)
-- [ ] Multi-admin RBAC + SSO on the portal; per-key two-person reveal approval
-- [ ] Fedora/RHEL support (dracut is already the easy path)
-- [ ] Graph API helper to stamp the portal key URL into the Intune device notes field
 
 ## License
 

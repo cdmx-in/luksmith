@@ -106,6 +106,39 @@ def pick_device(explicit):
     return devs[0]
 
 
+def distro_family():
+    """'rhel' for RHEL/Fedora/Rocky/Alma, else 'debian' (Ubuntu/Debian/default).
+
+    Reads /etc/os-release ID and ID_LIKE. Missing file -> debian, the safe
+    default: that's where the clevis + initramfs-tools workaround lives."""
+    try:
+        with open("/etc/os-release") as f:
+            data = f.read()
+    except OSError:
+        return "debian"
+    fields = dict(re.findall(r'^(ID|ID_LIKE)=["\']?([^"\'\n]*)', data, re.MULTILINE))
+    ids = f"{fields.get('ID', '')} {fields.get('ID_LIKE', '')}".lower().split()
+    return "rhel" if any(t in ids for t in ("rhel", "fedora", "centos")) else "debian"
+
+
+def default_mode():
+    """rhel-family defaults to systemd (dracut native TPM path); Debian to clevis."""
+    return "systemd" if distro_family() == "rhel" else "clevis"
+
+
+def regen_initramfs():
+    """Rebuild the initramfs so a new keyslot/token is seen at boot.
+
+    dracut on rhel-family, update-initramfs on Debian. Best-effort: failures
+    are non-fatal — the binding lives in the LUKS header regardless (and CI
+    runners have no cryptroot)."""
+    cmd = ["dracut", "--force"] if distro_family() == "rhel" else ["update-initramfs", "-u"]
+    p = run(cmd, stdin=None)
+    if p.returncode != 0:
+        print(f"luksmith: warning: {cmd[0]} failed: {(p.stderr or '').strip()}",
+              file=sys.stderr)
+
+
 def has_tpm():
     # TPM2TOOLS_TCTI covers software TPMs (swtpm) — tpm2-tools and clevis
     # both honor it, and child processes inherit it automatically.
@@ -262,16 +295,15 @@ def tpm_bind(device, mode, pcrs, unlock_key_file, with_pin=False):
         p = run(cmd, stdin=None)
         if p.returncode != 0:
             die(f"clevis luks bind failed: {(p.stderr or '').strip()}")
-        # Initramfs refresh failures are non-fatal: the TPM binding lives in
-        # the LUKS header regardless (CI runners have no cryptroot setup).
-        try:
-            install_tss_hook()
-        except OSError as e:
-            print(f"luksmith: warning: tss hook install failed: {e}", file=sys.stderr)
-        p = run(["update-initramfs", "-u"], stdin=None)
-        if p.returncode != 0:
-            print("luksmith: warning: update-initramfs failed: "
-                  f"{(p.stderr or '').strip()}", file=sys.stderr)
+        # The tss-user hook is a Debian/initramfs-tools workaround; rhel uses
+        # dracut's own clevis module. Regen is best-effort either way: the TPM
+        # binding lives in the LUKS header regardless (CI has no cryptroot).
+        if distro_family() == "debian":
+            try:
+                install_tss_hook()
+            except OSError as e:
+                print(f"luksmith: warning: tss hook install failed: {e}", file=sys.stderr)
+        regen_initramfs()
     else:  # systemd (dracut / non-root volumes)
         cmd = ["systemd-cryptenroll", "--tpm2-device=auto", f"--tpm2-pcrs={pcrs}"]
         if with_pin:
@@ -282,6 +314,10 @@ def tpm_bind(device, mode, pcrs, unlock_key_file, with_pin=False):
         p = run(cmd, stdin=None)
         if p.returncode != 0:
             die(f"systemd-cryptenroll tpm2 enrollment failed: {(p.stderr or '').strip()}")
+        # dracut native path: regenerate so the enrolled TPM2 token is picked
+        # up at boot. Debian systemd mode (non-root data volumes) needs no regen.
+        if distro_family() == "rhel":
+            regen_initramfs()
 
 
 TSS_HOOK_PATH = "/etc/initramfs-tools/hooks/luksmith-tss-user"
@@ -306,6 +342,8 @@ def install_tss_hook():
 
 
 def cmd_enroll(args):
+    if args.mode is None:
+        args.mode = default_mode()
     if args.with_pin and args.mode != "systemd":
         die("--with-pin requires --mode systemd (and a dracut initrd): "
             "TPM+PIN is a systemd-cryptenroll feature; clevis has no PIN support")
@@ -570,7 +608,10 @@ def cmd_check_updates(args):
                                       "update": rel.get("Version")})
         except ValueError:
             pass
-    print(json.dumps({"fde_breaking_updates": risky}, indent=2))
+    # fwupd behaves identically across distros; the manual-update trigger hint
+    # differs (dnf/rpm vs apt/dpkg), surfaced so schedulers can act per-distro.
+    pkg_mgr = "dnf" if distro_family() == "rhel" else "apt"
+    print(json.dumps({"fde_breaking_updates": risky, "pkg_manager": pkg_mgr}, indent=2))
     if risky:
         if getattr(args, "suspend", False):
             do_suspend(load_json(STATE_PATH, {}),
@@ -589,9 +630,10 @@ def main(argv=None):
     en.add_argument("--org-pubkey", help="path to org RSA public key (PEM)")
     en.add_argument("--enroll-secret", help="shared enrollment secret")
     en.add_argument("--device", help="LUKS device (auto-detected if single)")
-    en.add_argument("--mode", choices=["clevis", "systemd"], default="clevis",
-                    help="TPM bind mode: clevis = stock Ubuntu (initramfs-tools); "
-                         "systemd = dracut installs / non-root volumes")
+    en.add_argument("--mode", choices=["clevis", "systemd"], default=None,
+                    help="TPM bind mode (default: clevis on Debian/Ubuntu, "
+                         "systemd on RHEL/Fedora). clevis = stock Ubuntu "
+                         "(initramfs-tools); systemd = dracut installs / non-root volumes")
     en.add_argument("--pcrs", default="7", help="PCR list to bind (default: 7)")
     en.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
     en.add_argument("--no-tpm", action="store_true",
