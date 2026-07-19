@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   release:
@@ -92,3 +93,10 @@ jobs:
             --generate-notes \
             luksmith_*_all.deb luksmith.deb agent/luksmith.py install.sh \
             luksmith-server-linux-amd64 luksmith-server-linux-arm64 luksmith-ui.tar.gz
+
+      # Releases created with GITHUB_TOKEN never fire `release: published`
+      # (anti-recursion), but workflow_dispatch is exempt — trigger explicitly.
+      - name: Trigger apt repo publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run apt-repo.yml -R "$GITHUB_REPOSITORY"
