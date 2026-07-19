@@ -5,7 +5,7 @@
             "Operator": "IsEquals",
             "DataType": "Boolean",
             "Operand": true,
-            "MoreInfoUrl": "https://github.com/OWNER/luksmith#intune-integration",
+            "MoreInfoUrl": "https://github.com/cdmx-in/luksmith#intune-integration",
             "RemediationStrings": [
                 {
                     "Language": "en_US",
@@ -19,7 +19,7 @@
             "Operator": "IsEquals",
             "DataType": "Boolean",
             "Operand": true,
-            "MoreInfoUrl": "https://github.com/OWNER/luksmith#intune-integration",
+            "MoreInfoUrl": "https://github.com/cdmx-in/luksmith#intune-integration",
             "RemediationStrings": [
                 {
                     "Language": "en_US",
