@@ -1,0 +1,32 @@
+{
+    "Rules": [
+        {
+            "SettingName": "recovery_key_escrowed",
+            "Operator": "IsEquals",
+            "DataType": "Boolean",
+            "Operand": true,
+            "MoreInfoUrl": "https://github.com/OWNER/luksmith#intune-integration",
+            "RemediationStrings": [
+                {
+                    "Language": "en_US",
+                    "Title": "LUKS recovery key is not escrowed.",
+                    "Description": "Run 'sudo luksmith enroll' to escrow this device's disk recovery key to the org portal. Until then the device is out of compliance."
+                }
+            ]
+        },
+        {
+            "SettingName": "luksmith_present",
+            "Operator": "IsEquals",
+            "DataType": "Boolean",
+            "Operand": true,
+            "MoreInfoUrl": "https://github.com/OWNER/luksmith#intune-integration",
+            "RemediationStrings": [
+                {
+                    "Language": "en_US",
+                    "Title": "luksmith agent is not installed.",
+                    "Description": "Install the luksmith agent so disk encryption posture can be verified and the recovery key escrowed."
+                }
+            ]
+        }
+    ]
+}

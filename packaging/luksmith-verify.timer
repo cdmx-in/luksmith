@@ -1,0 +1,11 @@
+[Unit]
+Description=Run luksmith verify shortly after boot and daily thereafter
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=24h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=luksmith post-boot verification (boot classification, PCR drift, re-enrollment)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/luksmith/luksmith.py verify
