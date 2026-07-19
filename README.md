@@ -158,6 +158,14 @@ Boot then requires the TPM state *and* a PIN (prompted by systemd) — BitLocker
 
 A set `TPM2TOOLS_TCTI` counts as a present TPM — tpm2-tools and clevis honor it, so the whole clevis lifecycle runs against `swtpm socket --tpm2` (use `sudo -E` to keep the variable). CI's `tpm-integration` job uses exactly this to prove enroll → verify → PCR drift → auto-rebind on every push.
 
+## Hardware acceptance test
+
+CI proves the escrow crypto and the software-TPM lifecycle, but the one thing it
+can't cover is a real TPM unlocking a real disk. Before trusting luksmith on a
+fleet, run the ~30-minute checklist in [HARDWARE-TEST.md](HARDWARE-TEST.md) on a
+spare TPM machine: enroll → **reboot with no passphrase prompt** → reveal + decrypt
+the escrowed key → confirm it opens the volume.
+
 ## Security model
 
 - **E2E encryption:** keys are encrypted on the device to the org public key; the server stores ciphertext only. Compromising the server or its backups yields nothing usable without the org private key.
