@@ -40,10 +40,19 @@ TPM_FAILURE_MARKERS = (
 
 
 def run(cmd, **kwargs):
-    """Single choke point for subprocess calls (mocked in tests)."""
+    """Single choke point for subprocess calls (mocked in tests).
+
+    A missing binary (no TPM stack, no fwupd, ...) reports like a failed
+    command instead of crashing the agent."""
     kwargs.setdefault("capture_output", True)
     kwargs.setdefault("text", True)
-    return subprocess.run(cmd, **kwargs)
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except FileNotFoundError:
+        err = f"{cmd[0]}: not found"
+        if not kwargs.get("text"):
+            err = err.encode()
+        return subprocess.CompletedProcess(cmd, 127, None, err)
 
 
 def die(msg, code=1):

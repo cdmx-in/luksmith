@@ -56,6 +56,17 @@ class TestDiscovery(unittest.TestCase):
                              "a3b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1")
 
 
+class TestRun(unittest.TestCase):
+    def test_missing_binary_reports_as_failure_not_crash(self):
+        p = luksmith.run(["definitely-not-a-real-binary-xyz"])
+        self.assertEqual(p.returncode, 127)
+        self.assertIn("not found", p.stderr)
+        # e.g. read_pcr7 on a TPM-less machine must degrade to None
+        with mock.patch.object(luksmith.subprocess, "run",
+                               side_effect=FileNotFoundError):
+            self.assertIsNone(luksmith.read_pcr7())
+
+
 class TestRecoveryKey(unittest.TestCase):
     KEY = "cbdefghi-jklnrtuv-cbdefghi-jklnrtuv-cbdefghi-jklnrtuv-cbdefghi-jklnrtuv"
 
