@@ -1,0 +1,24 @@
+# luksmith escrow portal.
+#
+#   LUKSMITH_ADMIN_TOKEN=$(openssl rand -hex 32) \
+#   LUKSMITH_ENROLL_SECRET=$(openssl rand -hex 16) \
+#   docker compose up -d
+#
+# Terminate TLS in front of this (Caddy/nginx/Traefik) or mount certs and add
+# --tls-cert/--tls-key to `command`. The database holds only RSA ciphertext,
+# but tokens still deserve TLS.
+
+services:
+  luksmith-server:
+    build: ./server
+    ports:
+      - "8443:8443"
+    volumes:
+      - luksmith-data:/data
+    environment:
+      LUKSMITH_ADMIN_TOKEN: ${LUKSMITH_ADMIN_TOKEN:?set LUKSMITH_ADMIN_TOKEN}
+      LUKSMITH_ENROLL_SECRET: ${LUKSMITH_ENROLL_SECRET:?set LUKSMITH_ENROLL_SECRET}
+    restart: unless-stopped
+
+volumes:
+  luksmith-data:

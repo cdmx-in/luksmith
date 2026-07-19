@@ -56,40 +56,40 @@ After every boot, `luksmith verify` (systemd timer) classifies the boot — did 
 
 ## Quickstart
 
-### Portal (any box with Python 3.10+)
+### 1. One-time org keypair (on an admin workstation, NOT the server)
 
 ```bash
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out org_private.pem
 openssl pkey -in org_private.pem -pubout -out org_public.pem
-# Guard org_private.pem with your life (or at least your password manager).
-
-python3 server/luksmith_server.py \
-  --db /var/lib/luksmith-server.db \
-  --bind 0.0.0.0 --port 8443 \
-  --tls-cert cert.pem --tls-key key.pem \
-  --admin-token "$(openssl rand -hex 32)" \
-  --enroll-secret "$(openssl rand -hex 16)"
 ```
 
-Dashboard at `https://your-server:8443/` (HTTP Basic: any username, admin token as password).
+`org_private.pem` decrypts every escrowed key — keep it offline (password manager / HSM). Only `org_public.pem` gets distributed.
 
-### Agent (each Ubuntu 22.04/24.04 machine, disk already LUKS-encrypted)
+### 2. Portal
 
 ```bash
-sudo apt install clevis clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools
-sudo cp agent/luksmith.py /opt/luksmith/luksmith.py   # or your config mgmt
-sudo python3 /opt/luksmith/luksmith.py enroll \
-  --server https://keys.example.com:8443 \
-  --org-pubkey /etc/luksmith/org_public.pem \
-  --enroll-secret <secret>
-# Prompts once for the existing LUKS passphrase, then:
-# recovery key created -> escrowed -> TPM auto-unlock bound -> baseline stored.
-
-sudo cp packaging/luksmith-verify.{service,timer} /etc/systemd/system/
-sudo systemctl enable --now luksmith-verify.timer
+git clone https://github.com/cdmx-in/luksmith && cd luksmith
+LUKSMITH_ADMIN_TOKEN=$(openssl rand -hex 32) \
+LUKSMITH_ENROLL_SECRET=$(openssl rand -hex 16) \
+docker compose up -d
 ```
 
-Next reboot: no passphrase prompt. Lost machine or departed employee: reveal the ciphertext in the portal (reason mandatory, audited), decrypt on an admin workstation, type the recovery key at the normal prompt.
+No Docker? `python3 server/luksmith_server.py --admin-token ... --enroll-secret ...` — zero dependencies. Either way, put TLS in front (Caddy/nginx) or pass `--tls-cert/--tls-key`. Dashboard at `https://your-server:8443/` (HTTP Basic — any username, admin token as password).
+
+### 3. Agent (each Ubuntu 22.04/24.04 machine, disk already LUKS-encrypted)
+
+```bash
+wget https://github.com/cdmx-in/luksmith/releases/latest/download/luksmith.deb
+sudo apt install ./luksmith.deb
+sudo luksmith enroll --server https://YOUR-PORTAL:8443 \
+  --org-pubkey /etc/luksmith/org_public.pem --enroll-secret YOUR-SECRET
+```
+
+(From a checkout instead: `sudo ./install.sh` does the same.)
+
+Enroll prompts once for the existing LUKS passphrase, then: recovery key created → escrowed → TPM auto-unlock bound → PCR baseline stored. Next reboot: no passphrase prompt.
+
+**Recovering a machine** (lost laptop, departed employee, broken TPM): click *Reveal* in the portal (reason mandatory, audited), decrypt on the admin workstation with `org_private.pem`, type the recovery key at the normal boot prompt.
 
 ### Intune integration
 
@@ -118,11 +118,11 @@ PCR policy is **7 only** (Secure Boot certificates) by default — routine kerne
 
 ## What CI proves
 
-Every push runs the full chain on a real LUKS2 volume: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`). Hosted runners have no TPM, so the TPM bind itself is covered by unit tests; a VM-based TPM (swtpm) integration job is on the roadmap.
+Every push exercises the full chain on a real LUKS2 volume: format → enroll → escrow → admin reveal → RSA decrypt → **the recovered key actually opens the volume** (`cryptsetup open --test-passphrase`) → admin-triggered rotation → **the old key no longer opens it, the new one does**. Plus unit tests on Python 3.10/3.12 (Ubuntu 22.04/24.04's interpreters), the Intune discovery script run against fixture data, shellcheck, and a Docker image build with a live health check. Hosted runners have no TPM, so the TPM bind itself is covered by unit tests; a swtpm-in-VM job is on the roadmap.
 
 ## Roadmap
 
-- [ ] `.deb` packaging + apt repo
+- [x] `.deb` packaging (attached to releases); apt repo later
 - [ ] swtpm-based CI job exercising the full clevis TPM path
 - [ ] BitLocker-style pre-reboot suspend (temporary PCR-less slot) around `affects-fde` firmware updates
 - [ ] TPM+PIN enrollment UX (`--tpm2-with-pin`) as a first-class mode

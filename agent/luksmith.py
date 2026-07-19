@@ -400,6 +400,47 @@ def cmd_verify(args):
     print(json.dumps(report, indent=2))
 
 
+def cmd_rotate(args):
+    """New recovery key, escrowed, old recovery slots wiped.
+
+    Wipe and enrollment happen in one systemd-cryptenroll call (the newly
+    enrolled slot is excepted from wiping), so there is no window with zero
+    recovery slots. If the subsequent escrow fails, compliance.json flags the
+    device un-escrowed and Intune/portal show it red until a retry succeeds.
+    """
+    state = load_json(STATE_PATH, {})
+    config = load_json(CONFIG_PATH, {})
+    if not state.get("device_id"):
+        die("not enrolled; run `luksmith enroll` first")
+    device = state["luks_device"]
+
+    cmd = ["systemd-cryptenroll", "--wipe-slot=recovery", "--recovery-key"]
+    if args.unlock_key_file:
+        cmd.append(f"--unlock-key-file={args.unlock_key_file}")
+    cmd.append(device)
+    p = run(cmd, stdin=None)
+    if p.returncode != 0:
+        die(f"recovery key rotation failed: {(p.stderr or '').strip()}")
+    m = RECOVERY_KEY_RE.search(p.stdout or "")
+    if not m:
+        die("could not parse rotated recovery key from systemd-cryptenroll output")
+
+    state["recovery_escrowed"] = False
+    save_json(STATE_PATH, state)
+    write_compliance(state)
+
+    ciphertext = encrypt_to_org_key(m.group(0), config["org_pubkey"])
+    resp = api(config, "POST", "/api/v1/keys",
+               {"device_id": state["device_id"], "ciphertext": ciphertext},
+               token=state["device_token"])
+    state["recovery_escrowed"] = True
+    state["escrow_key_id"] = resp.get("key_id")
+    save_json(STATE_PATH, state)
+    write_compliance(state)
+    print(json.dumps({"rotated": True, "escrow_key_id": state["escrow_key_id"]},
+                     indent=2))
+
+
 def cmd_check_updates(args):
     """Flag pending updates that will change PCR 7 (fwupd `affects-fde`)."""
     p = run(["fwupdmgr", "get-updates", "--json"])
@@ -443,11 +484,14 @@ def main(argv=None):
     ve = sub.add_parser("verify", help="post-boot: classify boot, detect PCR drift, re-enroll")
     ve.add_argument("--no-regen", action="store_true", help="report only, never rebind")
 
+    ro = sub.add_parser("rotate", help="replace + re-escrow the recovery key")
+    ro.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
+
     sub.add_parser("check-updates", help="warn about pending PCR-breaking firmware updates")
 
     args = ap.parse_args(argv)
-    {"status": cmd_status, "enroll": cmd_enroll,
-     "verify": cmd_verify, "check-updates": cmd_check_updates}[args.cmd](args)
+    {"status": cmd_status, "enroll": cmd_enroll, "verify": cmd_verify,
+     "rotate": cmd_rotate, "check-updates": cmd_check_updates}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        run: |
+          set -eux
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG=pkg
+          mkdir -p $PKG/DEBIAN $PKG/opt/luksmith $PKG/usr/bin $PKG/lib/systemd/system
+          cp agent/luksmith.py $PKG/opt/luksmith/luksmith.py
+          printf '#!/bin/sh\nexec python3 /opt/luksmith/luksmith.py "$@"\n' > $PKG/usr/bin/luksmith
+          chmod 755 $PKG/usr/bin/luksmith
+          cp packaging/luksmith-verify.service packaging/luksmith-verify.timer $PKG/lib/systemd/system/
+          cat > $PKG/DEBIAN/control <<EOF
+          Package: luksmith
+          Version: $VERSION
+          Architecture: all
+          Priority: optional
+          Section: admin
+          Depends: python3, clevis, clevis-luks, clevis-tpm2, clevis-initramfs, tpm2-tools, systemd
+          Maintainer: Codemax IT Solutions Pvt Ltd <roney.dsilva@cdmx.in>
+          Homepage: https://github.com/cdmx-in/luksmith
+          Description: Org-grade LUKS management for Ubuntu
+           TPM2 auto-unlock, recovery-key escrow to a self-hosted portal,
+           post-boot verification and PCR-drift re-enrollment.
+          EOF
+          cat > $PKG/DEBIAN/postinst <<'EOF'
+          #!/bin/sh
+          set -e
+          systemctl daemon-reload || true
+          systemctl enable --now luksmith-verify.timer || true
+          EOF
+          chmod 755 $PKG/DEBIAN/postinst
+          dpkg-deb --build --root-owner-group $PKG "luksmith_${VERSION}_all.deb"
+          cp "luksmith_${VERSION}_all.deb" luksmith.deb
+
+      - name: Smoke-test the .deb
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y ./luksmith.deb
+          luksmith status
+          systemctl is-enabled luksmith-verify.timer
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "luksmith $GITHUB_REF_NAME" \
+            --generate-notes \
+            luksmith_*_all.deb luksmith.deb agent/luksmith.py install.sh

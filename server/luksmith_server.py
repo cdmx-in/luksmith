@@ -25,6 +25,7 @@ import secrets
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -62,20 +63,30 @@ def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
 
+def locked(method):
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class Store:
+    # ponytail: one connection + one lock serializes everything; move to a
+    # connection pool if fleet size ever makes this a bottleneck.
     def __init__(self, path):
+        self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        # ponytail: one connection + sqlite's own locking; move to a pool if
-        # fleet size ever makes this a bottleneck.
 
+    @locked
     def audit(self, actor, action, device_id=None, detail=None):
         self.db.execute(
             "INSERT INTO audit (ts, actor, action, device_id, detail) VALUES (?,?,?,?,?)",
             (int(time.time()), actor, action, device_id, detail))
         self.db.commit()
 
+    @locked
     def enroll_device(self, hostname, machine_id):
         row = self.db.execute(
             "SELECT id FROM devices WHERE machine_id=?", (machine_id,)).fetchone()
@@ -93,6 +104,7 @@ class Store:
         self.db.commit()
         return device_id, token
 
+    @locked
     def device_by_token(self, token):
         h = sha256(token)
         for row in self.db.execute("SELECT * FROM devices"):
@@ -100,6 +112,7 @@ class Store:
                 return row
         return None
 
+    @locked
     def escrow(self, device_id, ciphertext):
         key_id = secrets.token_hex(8)
         now = int(time.time())
@@ -114,6 +127,7 @@ class Store:
         self.db.commit()
         return key_id
 
+    @locked
     def checkin(self, device_id, report):
         self.db.execute("UPDATE devices SET last_seen=?, last_report=? WHERE id=?",
                         (int(time.time()), json.dumps(report), device_id))
@@ -122,21 +136,25 @@ class Store:
                               (device_id,)).fetchone()
         return bool(row and row["rotate_requested"])
 
+    @locked
     def devices(self):
         return self.db.execute(
             "SELECT d.*, (SELECT COUNT(*) FROM keys k WHERE k.device_id=d.id"
             " AND k.retired_at IS NULL) AS active_keys FROM devices d"
             " ORDER BY hostname").fetchall()
 
+    @locked
     def active_key(self, device_id):
         return self.db.execute(
             "SELECT * FROM keys WHERE device_id=? AND retired_at IS NULL"
             " ORDER BY created_at DESC LIMIT 1", (device_id,)).fetchone()
 
+    @locked
     def request_rotate(self, device_id):
         self.db.execute("UPDATE devices SET rotate_requested=1 WHERE id=?", (device_id,))
         self.db.commit()
 
+    @locked
     def audit_log(self, limit=200):
         return self.db.execute(
             "SELECT * FROM audit ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
@@ -291,8 +309,8 @@ class Handler(BaseHTTPRequestHandler):
             self.store.audit("admin", "rotate_requested", device_id)
             return self.send(200, {"rotate_requested": True})
 
-        if path.startswith("/api/v1/keys/") or \
-                (path.startswith("/keys/") and path.endswith("/reveal")):
+        if path.endswith("/reveal") and \
+                (path.startswith("/api/v1/keys/") or path.startswith("/keys/")):
             return self.reveal(path)
 
         self.send(404, {"error": "not found"})
