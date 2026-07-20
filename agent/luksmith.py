@@ -168,6 +168,15 @@ def clevis_tpm2_slot(device):
     return slots[0] if slots else None
 
 
+def clevis_slot(device, pin):
+    """First clevis keyslot bound with `pin` (tpm2/tang/sss), or None."""
+    p = run(["clevis", "luks", "list", "-d", device])
+    if p.returncode != 0:
+        return None
+    m = re.search(rf"^(\d+):\s+{pin}\b", p.stdout, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
 def read_pcr7():
     """Current sha256 PCR 7 value as hex, or None without a TPM."""
     p = run(["tpm2_pcrread", "sha256:7"])
@@ -236,6 +245,7 @@ def write_compliance(state, extra=None):
     data = {
         "disk_encrypted": True,
         "tpm_bound": bool(state.get("tpm_mode")),
+        "unlock_mode": state.get("tpm_mode"),  # clevis/systemd (TPM), tang (network), or null
         "recovery_key_escrowed": bool(state.get("recovery_escrowed")),
         "escrow_key_id": state.get("escrow_key_id"),
         "last_verify": state.get("last_verify"),
@@ -284,7 +294,23 @@ def enroll_recovery_key(device, unlock_key_file):
     return m.group(0)
 
 
-def tpm_bind(device, mode, pcrs, unlock_key_file, with_pin=False):
+def tpm_bind(device, mode, pcrs, unlock_key_file, with_pin=False, tang_url=None):
+    if mode == "tang":
+        # Network-bound auto-unlock (clevis + Tang, NBDE): the BitLocker-without-
+        # -TPM analog. clevis mints a fresh random key per machine, split against
+        # the Tang server's key — no shared secret, no TPM. Off-network the
+        # recovery keyslot still unlocks. No PCRs, so no drift/tss-hook needed.
+        if not shutil.which("clevis"):
+            die("clevis not installed (apt install clevis clevis-luks clevis-initramfs)")
+        cmd = ["clevis", "luks", "bind", "-y", "-d", device, "tang",
+               json.dumps({"url": tang_url})]  # -y: auto-trust the org's Tang key
+        if unlock_key_file:
+            cmd[4:4] = ["-k", unlock_key_file]
+        p = run(cmd, stdin=None)
+        if p.returncode != 0:
+            die(f"clevis luks bind (tang) failed: {(p.stderr or '').strip()}")
+        regen_initramfs()  # network unlock lives in initramfs (clevis-initramfs)
+        return
     if mode == "clevis":
         if not shutil.which("clevis"):
             die("clevis not installed (apt install clevis clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools)")
@@ -347,6 +373,9 @@ def cmd_enroll(args):
     if args.with_pin and args.mode != "systemd":
         die("--with-pin requires --mode systemd (and a dracut initrd): "
             "TPM+PIN is a systemd-cryptenroll feature; clevis has no PIN support")
+    if args.mode == "tang" and not args.tang_url:
+        die("--mode tang requires --tang-url http://TANG-SERVER "
+            "(network-bound auto-unlock, no TPM needed)")
     config = load_json(CONFIG_PATH, {})
     if args.server:
         config["server_url"] = args.server
@@ -382,8 +411,13 @@ def cmd_enroll(args):
     state["escrow_key_id"] = resp.get("key_id")
     del recovery_key, ciphertext
 
-    # 4. Only now: TPM auto-unlock binding.
-    if args.no_tpm or not has_tpm():
+    # 4. Only now: auto-unlock binding.
+    if args.mode == "tang":
+        # Network-bound: no TPM required, so bind regardless of has_tpm().
+        tpm_bind(device, "tang", None, args.unlock_key_file, tang_url=args.tang_url)
+        state["tpm_mode"] = "tang"
+        state["tang_url"] = args.tang_url
+    elif args.no_tpm or not has_tpm():
         state["tpm_mode"] = None
         print("recovery key escrowed; skipping TPM bind"
               + ("" if has_tpm() else " (no TPM present)"))
@@ -393,6 +427,10 @@ def cmd_enroll(args):
         state["pcrs"] = args.pcrs
         state["pin"] = bool(args.with_pin)
         state["pcr7_baseline"] = read_pcr7()
+        if state["pcr7_baseline"] is None:
+            print("luksmith: warning: TPM bound but PCR baseline unreadable "
+                  "(is tpm2-tools installed?) — drift detection is disabled",
+                  file=sys.stderr)
 
     state["luks_device"] = device
     save_json(STATE_PATH, state)
@@ -409,12 +447,14 @@ def classify_boot(state):
     mode = state.get("tpm_mode")
     if not mode:
         return "no_tpm_binding"
-    if mode == "clevis":
-        slot = clevis_tpm2_slot(device)
+    if mode in ("clevis", "tang"):
+        pin = "tpm2" if mode == "clevis" else "tang"
+        slot = clevis_slot(device, pin)
         if slot is None:
             return "tpm_binding_missing"
-        # If the sealed secret can't be unsealed against *current* PCRs, it
-        # cannot have unlocked this boot either -> a human typed a secret.
+        # If the secret can't be recovered now (drifted PCRs, or Tang server
+        # unreachable), it can't have auto-unlocked this boot either -> a human
+        # typed the recovery key.
         p = run(["clevis", "luks", "pass", "-d", device, "-s", str(slot)])
         return "tpm_unlock_ok" if p.returncode == 0 else "fallback_used"
     # systemd mode: the initrd journal records the unseal outcome.
@@ -630,10 +670,12 @@ def main(argv=None):
     en.add_argument("--org-pubkey", help="path to org RSA public key (PEM)")
     en.add_argument("--enroll-secret", help="shared enrollment secret")
     en.add_argument("--device", help="LUKS device (auto-detected if single)")
-    en.add_argument("--mode", choices=["clevis", "systemd"], default=None,
-                    help="TPM bind mode (default: clevis on Debian/Ubuntu, "
-                         "systemd on RHEL/Fedora). clevis = stock Ubuntu "
-                         "(initramfs-tools); systemd = dracut installs / non-root volumes")
+    en.add_argument("--mode", choices=["clevis", "systemd", "tang"], default=None,
+                    help="auto-unlock mode (default: clevis on Debian/Ubuntu, "
+                         "systemd on RHEL/Fedora). clevis/systemd = TPM; "
+                         "tang = network-bound (clevis+Tang), no TPM needed")
+    en.add_argument("--tang-url", help="Tang server URL, required for --mode tang "
+                                       "(e.g. http://tang.example.com)")
     en.add_argument("--pcrs", default="7", help="PCR list to bind (default: 7)")
     en.add_argument("--unlock-key-file", help="existing passphrase file (non-interactive)")
     en.add_argument("--no-tpm", action="store_true",

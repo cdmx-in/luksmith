@@ -207,6 +207,77 @@ jobs:
           grep -q '"boot_class": "tpm_unlock_ok"' verify3.json
           grep -q '"pcr7_drift": false' verify3.json
 
+  tang-integration:
+    # TPM-less auto-unlock (the BitLocker-without-TPM analog): enroll --mode tang
+    # against a local Tang server, prove the network-bound slot unseals
+    # (boot_class tpm_unlock_ok), then take Tang down and prove the boot
+    # correctly classifies as fallback_used. No TPM involved.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clevis + tang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clevis clevis-luks tang cryptsetup-bin
+
+      - name: Start a local Tang server (socket-activated on :8080)
+        run: |
+          set -eux
+          sudo mkdir -p /var/db/tang
+          sudo tangd-keygen /var/db/tang
+          TANGD=$(dpkg -L tang | grep -E '/tangd$' | head -1)
+          sudo /usr/lib/systemd/systemd-socket-activate -l 8080 "$TANGD" /var/db/tang &
+          sleep 2
+          curl -sf http://127.0.0.1:8080/adv >/dev/null
+
+      - name: Create LUKS2 test volume
+        run: |
+          set -eux
+          truncate -s 64M disk.img
+          echo -n "original-passphrase" > pass.txt
+          sudo cryptsetup luksFormat --type luks2 --batch-mode disk.img pass.txt
+          LOOP=$(sudo losetup --find --show disk.img)
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+
+      - name: Generate org RSA keypair + start escrow server
+        run: |
+          set -eux
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out org_private.pem
+          openssl pkey -in org_private.pem -pubout -out org_public.pem
+          python3 server/luksmith_server.py --db ci.db --port 8443 \
+            --admin-token ci-admin --enroll-secret ci-enroll &
+          sleep 1
+          curl -sf http://127.0.0.1:8443/healthz
+
+      - name: Enroll with Tang bind (no TPM present)
+        run: |
+          set -eux
+          sudo python3 agent/luksmith.py enroll \
+            --server http://127.0.0.1:8443 \
+            --org-pubkey "$PWD/org_public.pem" \
+            --enroll-secret ci-enroll \
+            --device "$LOOP" \
+            --mode tang --tang-url http://127.0.0.1:8080 \
+            --unlock-key-file "$PWD/pass.txt" | tee enroll.json
+          grep -q '"tpm_mode": "tang"' enroll.json
+          sudo clevis luks list -d "$LOOP" | tee clevis.txt
+          grep -q 'tang' clevis.txt
+
+      - name: Verify reports tpm_unlock_ok while Tang is reachable
+        run: |
+          set -eux
+          sudo python3 agent/luksmith.py verify --no-regen | tee verify1.json
+          grep -q '"boot_class": "tpm_unlock_ok"' verify1.json
+
+      - name: Take Tang down -> boot classifies as fallback_used
+        run: |
+          set -eux
+          sudo pkill -f systemd-socket-activate || true
+          sleep 1
+          sudo python3 agent/luksmith.py verify --no-regen | tee verify2.json
+          grep -q '"boot_class": "fallback_used"' verify2.json
+
   intune-script:
     runs-on: ubuntu-latest
     steps:
@@ -246,10 +317,9 @@ jobs:
         working-directory: ui
       - run: npm run build
         working-directory: ui
-      - uses: actions/upload-artifact@v4
-        with:
-          name: luksmith-ui-dist
-          path: ui/dist
+        # ponytail: build proves the UI compiles; artifact upload dropped — it
+        # was never downloaded and Actions artifact storage is near the 0.5 GB cap.
+        # The release build (release.yml) still ships dist to GitHub Releases.
 
   server-go:
     runs-on: ubuntu-latest

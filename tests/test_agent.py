@@ -116,6 +116,46 @@ class TestClassifyBoot(unittest.TestCase):
         with mock.patch.object(luksmith, "run", return_value=proc("all fine\n")):
             self.assertEqual(luksmith.classify_boot(state), "tpm_unlock_ok")
 
+    def test_tang_unseal_ok(self):
+        # tang mode reuses the clevis unseal path but keys off the tang pin.
+        def fake(cmd, **kw):
+            if cmd[:3] == ["clevis", "luks", "list"]:
+                return proc("1: tang '{\"url\":\"http://tang\"}'\n")
+            if cmd[:3] == ["clevis", "luks", "pass"]:
+                return proc("sekrit")
+            raise AssertionError(cmd)
+        state = {"luks_device": "/dev/sda3", "tpm_mode": "tang"}
+        with mock.patch.object(luksmith, "run", side_effect=fake):
+            self.assertEqual(luksmith.classify_boot(state), "tpm_unlock_ok")
+
+    def test_tang_server_unreachable_means_fallback(self):
+        def fake(cmd, **kw):
+            if cmd[:3] == ["clevis", "luks", "list"]:
+                return proc("1: tang '{\"url\":\"http://tang\"}'\n")
+            return proc("", 1, "Error communicating with server")
+        state = {"luks_device": "/dev/sda3", "tpm_mode": "tang"}
+        with mock.patch.object(luksmith, "run", side_effect=fake):
+            self.assertEqual(luksmith.classify_boot(state), "fallback_used")
+
+
+class TestTangBind(unittest.TestCase):
+    def test_tang_bind_uses_tang_pin_and_url(self):
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            return proc("")
+        with mock.patch.object(luksmith, "run", side_effect=fake), \
+                mock.patch.object(luksmith.shutil, "which", return_value="/usr/bin/clevis"), \
+                mock.patch.object(luksmith, "regen_initramfs"):
+            luksmith.tpm_bind("/dev/sda3", "tang", None, "/tmp/pass.key",
+                              tang_url="http://tang.example.com")
+        bind = next(c for c in calls if c[:3] == ["clevis", "luks", "bind"])
+        self.assertIn("tang", bind)
+        self.assertIn('{"url": "http://tang.example.com"}', bind)
+        self.assertIn("-y", bind)  # non-interactive: auto-trust the org Tang key
+        self.assertIn("-k", bind)  # unlock keyfile threaded through
+
 
 class TestHasTpm(unittest.TestCase):
     def test_tcti_env_counts_as_tpm(self):

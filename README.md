@@ -20,11 +20,12 @@ luksmith is the missing piece: a zero-dependency agent + self-hosted portal that
 
 ## Why this exists
 
-Three facts make this project necessary:
+Four facts make this project necessary:
 
-1. **Stock Ubuntu can't TPM-unlock its root disk with systemd alone.** `systemd-cryptenroll --tpm2-device=auto` *succeeds*, then the boot prompt ignores it — Ubuntu's initramfs-tools doesn't understand TPM2 tokens ([LP #1980018](https://bugs.launchpad.net/ubuntu/+source/cryptsetup/+bug/1980018), deliberately unfixed). Working auto-unlock on stock installs needs clevis plus an initramfs fix luksmith applies for you.
-2. **You cannot store Linux keys in Intune/Entra.** The BitLocker key store is read-only via Graph; its write path is welded to the Windows MDM stack. Intune can only *check* Linux encryption compliance. So the portal has to be yours — luksmith ships it.
-3. **Nobody combines enrollment and escrow.** Fleet escrows but won't touch the TPM (and it's Premium-only). clevis/sectpmctl do TPM but have no server. luksmith does both, in the right order.
+1. **A shared LUKS passphrase is a fleet-wide single point of failure.** LUKS itself only gives you *a* passphrase, so orgs do the obvious thing at scale — set one common unlock passphrase across every machine. The day it leaks (a departing admin, a support ticket, a sticky note), *every* disk in the fleet is decryptable and there's no way to know which were touched — encryption control fails completely, silently, everywhere at once. luksmith removes the shared secret entirely: enroll mints a **unique** recovery key per machine, escrows it end-to-end encrypted, and binds TPM auto-unlock so nobody ever types or shares a passphrase at boot. A leak is now one machine, rotatable (`luksmith rotate`) and audited — not the whole fleet.
+2. **Stock Ubuntu can't TPM-unlock its root disk with systemd alone.** `systemd-cryptenroll --tpm2-device=auto` *succeeds*, then the boot prompt ignores it — Ubuntu's initramfs-tools doesn't understand TPM2 tokens ([LP #1980018](https://bugs.launchpad.net/ubuntu/+source/cryptsetup/+bug/1980018), deliberately unfixed). Working auto-unlock on stock installs needs clevis plus an initramfs fix luksmith applies for you.
+3. **You cannot store Linux keys in Intune/Entra.** The BitLocker key store is read-only via Graph; its write path is welded to the Windows MDM stack. Intune can only *check* Linux encryption compliance. So the portal has to be yours — luksmith ships it.
+4. **Nobody combines enrollment and escrow.** Fleet escrows but won't touch the TPM (and it's Premium-only). clevis/sectpmctl do TPM but have no server. luksmith does both, in the right order.
 
 ## Architecture
 
@@ -130,9 +131,20 @@ The master `--admin-token` still works as a superuser, but the portal also suppo
 |---|---|---|
 | `--mode clevis` | Default on Debian/Ubuntu (GRUB + initramfs-tools) | `clevis luks bind` on PCR 7 + the `tss`-user initramfs hook luksmith installs (works around the packaging gap that breaks TPM at early boot) |
 | `--mode systemd` | Default on Fedora/RHEL (dracut); also Ubuntu ≥25.10 or non-root data volumes | Native `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7` |
-| `--no-tpm` | Servers/VMs without TPM, or escrow-only rollouts | Recovery key + escrow only; passphrase prompt remains |
+| `--mode tang` | **Machines with no TPM** (BitLocker's TPM-less mode) — auto-unlock on the corp network | `clevis luks bind … tang` against your Tang server; needs `--tang-url`. Off-network → recovery-key prompt (graceful) |
+| `--no-tpm` | Servers/VMs where you want escrow-only | Recovery key + escrow only; passphrase prompt remains |
 
 The default follows the distro (`/etc/os-release`); `--mode` always overrides.
+
+**No TPM? Use `--mode tang`.** Just as BitLocker unlocks TPM-less machines with a USB startup key or boot PIN, luksmith unlocks them by *network presence*: [clevis](https://github.com/latchset/clevis) mints a **unique random key per machine** split against a [Tang](https://github.com/latchset/tang) server (a tiny stateless daemon — `apt install tang`, one systemd socket), so a machine auto-unlocks only on your network and never shares a passphrase. Off-network it falls back to the escrowed recovery key. Run one Tang server beside the portal, then:
+
+```bash
+sudo luksmith enroll --server https://YOUR-PORTAL:8443 \
+  --org-pubkey /etc/luksmith/org_public.pem --enroll-secret YOUR-SECRET \
+  --mode tang --tang-url http://YOUR-TANG:80
+```
+
+There are no PCRs to drift, so Tang machines never get a post-firmware-update recovery prompt.
 
 PCR policy is **7 only** (Secure Boot certificates) by default — routine kernel/GRUB updates don't change it, so no recovery prompts after `apt upgrade`. What *does* change it (Secure Boot toggles, dbx/firmware updates): `luksmith check-updates` flags pending fwupd updates marked `affects-fde` before you reboot, and `verify` re-binds automatically after (pass `--unlock-key-file` to let it rebind from scratch when the old binding can't unseal at all).
 
